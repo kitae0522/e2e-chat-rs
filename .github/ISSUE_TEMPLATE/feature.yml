@@ -1,0 +1,27 @@
+name: "❇️ New Feature"
+description: "Propose a new feature."
+labels: ["❇️ feature"]
+body:
+  - type: textarea
+    attributes:
+      label: "❇️ Overview"
+      description: "Describe the feature."
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: "🔨 Tasks"
+      description: "Checklist of work."
+      placeholder: "- [ ] Task 1\n- [ ] Task 2"
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: "📋 Acceptance Criteria"
+      description: "Testable conditions for completion."
+      placeholder: "- [ ] User can...\n- [ ] System should..."
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: "🙋🏻 Notes"

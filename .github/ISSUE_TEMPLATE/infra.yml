@@ -1,0 +1,31 @@
+name: "🔧 Infrastructure"
+description: "Infrastructure improvement."
+labels: ["🔧 infra"]
+body:
+  - type: textarea
+    attributes:
+      label: "🔧 Overview"
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: "📦 Area"
+      options: [Backend, Frontend, DevOps/CI, Database, Other]
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: "📋 As-Is (Current)"
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: "🎯 To-Be (Goal)"
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: "🔨 Tasks"
+      placeholder: "- [ ] Select library\n- [ ] Implement\n- [ ] Test\n- [ ] Migrate"
+    validations:
+      required: true

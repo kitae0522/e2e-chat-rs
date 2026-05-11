@@ -1,0 +1,20 @@
+name: "🐞 Bug Report"
+description: "Report a bug."
+labels: ["🐞 bug"]
+body:
+  - type: textarea
+    attributes:
+      label: "🐞 Description"
+      description: "What happened?"
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: "📄 Error Log"
+      render: shell
+  - type: textarea
+    attributes:
+      label: "🌏 Environment"
+      placeholder: "OS: macOS 14\nTypescript: latest\nbun: latest"
+    validations:
+      required: true

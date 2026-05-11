@@ -1,0 +1,31 @@
+[tools]
+rust = { version = "1.95.0", profile = "default", components = "rustfmt,clippy" }
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.fmt-fix]
+description = "Format Rust code"
+run = "cargo fmt --all"
+
+[tasks.check]
+description = "Type-check the workspace"
+run = "cargo check --workspace"
+
+[tasks.clippy]
+description = "Lint the workspace"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test --workspace"
+
+[tasks.verify]
+description = "Run the full local verification suite"
+run = [
+  { task = "fmt" },
+  { task = "check" },
+  { task = "clippy" },
+  { task = "test" },
+]

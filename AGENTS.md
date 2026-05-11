@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository is currently in setup/design phase. The planned Rust workspace keeps production crates under `crates/`: `crates/chat-core` for protocol and crypto, `crates/chat-server` for the event-driven relay, and `crates/chat-client` for the tiny CLI client. Put integration tests in `tests/`, reusable docs in `docs/`, and decision notes in `docs/checkpoints/`.
+This Rust workspace keeps production crates under `crates/`: `crates/chat-core` for protocol and crypto, `crates/chat-server` for the event-driven relay, and `crates/chat-client` for the tiny CLI client. Keep reusable docs in `docs/`, architecture notes in `docs/ARCHITECTURE.md`, and decision notes in `docs/checkpoints/`.
 
 ## Build, Test, and Development Commands
 

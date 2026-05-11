@@ -26,7 +26,25 @@ Use TDD for feature work. Place unit tests next to code in `#[cfg(test)] mod tes
 
 ## Commit & Pull Request Guidelines
 
-No commit history is available in this checkout, so use concise imperative commit subjects, preferably Conventional Commit style such as `feat: add websocket handshake` or `fix: handle closed peer stream`. Pull requests should include a short summary, testing evidence, linked issues when available, and screenshots or logs for user-visible behavior.
+Use clear branch names: `<type>/<issue-number>/<title>`, for example `feature/1/workspace-setup` or `fix/12/nonce-validation`. Keep the branch type lowercase, and keep the title short, lowercase, and hyphenated.
+
+Commit subject types must be uppercase, for example `CHORE: Rust 워크스페이스 설정` or `FEAT: 암호화 세션 추가`. Commit messages must be easy to read and include this structure in the body:
+
+- `어떤 작업을 했는가`: the work category or scope.
+- `어떤 이슈인가`: the related issue or problem.
+- `그래서 무엇을 했는가`: the concrete change.
+
+Example:
+
+```text
+CHORE: Rust 워크스페이스 설정
+
+- 어떤 작업을 했는가: Rust 프로젝트 초기 설정
+- 어떤 이슈인가: #1 E2E 채팅 v1 구현 준비
+- 그래서 무엇을 했는가: mise, Cargo workspace, 기본 크레이트 구조 추가
+```
+
+Pull requests must use the repository PR template and be written in Korean. Merge PRs with rebase and fast-forward only; avoid merge commits.
 
 ## Security & Configuration Tips
 

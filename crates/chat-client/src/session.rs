@@ -39,6 +39,10 @@ impl ClientSession {
         }
     }
 
+    pub fn is_ready(&self) -> bool {
+        self.crypto_session.is_some()
+    }
+
     pub fn handle_event(&mut self, event: WireEvent) -> Result<Option<String>, ClientSessionError> {
         match event {
             WireEvent::PeerKey {
@@ -162,5 +166,23 @@ mod tests {
         let decrypted = bob.handle_event(event).expect("decrypt").expect("message");
 
         assert_eq!(decrypted, "hello bob");
+    }
+
+    #[test]
+    fn reports_ready_after_peer_key_exchange() {
+        let mut alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let bob = ClientSession::new(
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+
+        assert!(!alice.is_ready());
+
+        alice.handle_event(bob.peer_key_event()).expect("bob key");
+
+        assert!(alice.is_ready());
     }
 }

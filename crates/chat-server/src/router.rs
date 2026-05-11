@@ -32,11 +32,17 @@ impl InMemoryRouter {
         }
 
         let recipient = recipient_for(connection_id, &event)?;
+        let ack = ack_for(&event);
         let Some(outbox) = self.outboxes.get_mut(&recipient) else {
             return Err(RouterError::UnknownRecipient);
         };
 
         outbox.push_back(event);
+        if let Some(ack) = ack
+            && let Some(sender_outbox) = self.outboxes.get_mut(connection_id)
+        {
+            sender_outbox.push_back(ack);
+        }
         Ok(())
     }
 
@@ -80,6 +86,18 @@ fn recipient_for(connection_id: &ClientId, event: &WireEvent) -> Result<ClientId
     }
 }
 
+fn ack_for(event: &WireEvent) -> Option<WireEvent> {
+    match event {
+        WireEvent::EncryptedMessage(envelope) => Some(WireEvent::Ack {
+            message_id: envelope.message_id,
+        }),
+        WireEvent::ClientHello { .. }
+        | WireEvent::PeerKey { .. }
+        | WireEvent::Ack { .. }
+        | WireEvent::Error { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +131,7 @@ mod tests {
         let mut router = InMemoryRouter::default();
         let alice = ClientId::parse("alice").expect("alice");
         let bob = ClientId::parse("bob").expect("bob");
+        let message_id = MessageId::new();
 
         router.connect(alice.clone()).expect("connect alice");
         router.connect(bob.clone()).expect("connect bob");
@@ -122,7 +141,7 @@ mod tests {
                 WireEvent::EncryptedMessage(EncryptedEnvelope {
                     sender: alice.clone(),
                     recipient: bob.clone(),
-                    message_id: MessageId::new(),
+                    message_id,
                     nonce: NonceBytes::from_array([7; 24]),
                     ciphertext: Ciphertext::from_bytes(vec![1, 2, 3]),
                 }),
@@ -133,6 +152,33 @@ mod tests {
 
         assert_eq!(outbox.len(), 1);
         assert!(matches!(outbox[0], WireEvent::EncryptedMessage(_)));
+    }
+
+    #[test]
+    fn acks_accepted_encrypted_message_to_sender_outbox() {
+        let mut router = InMemoryRouter::default();
+        let alice = ClientId::parse("alice").expect("alice");
+        let bob = ClientId::parse("bob").expect("bob");
+        let message_id = MessageId::new();
+
+        router.connect(alice.clone()).expect("connect alice");
+        router.connect(bob.clone()).expect("connect bob");
+        router
+            .route(
+                &alice,
+                WireEvent::EncryptedMessage(EncryptedEnvelope {
+                    sender: alice.clone(),
+                    recipient: bob,
+                    message_id,
+                    nonce: NonceBytes::from_array([8; 24]),
+                    ciphertext: Ciphertext::from_bytes(vec![4, 5, 6]),
+                }),
+            )
+            .expect("route encrypted message");
+
+        let outbox = router.drain_outbox(&alice);
+
+        assert_eq!(outbox, vec![WireEvent::Ack { message_id }]);
     }
 
     #[test]

@@ -80,10 +80,15 @@ async fn run(args: Args) -> Result<()> {
                     Message::Text(payload) => {
                         let event = serde_json::from_str::<WireEvent>(payload.as_ref())
                             .context("decode websocket event")?;
+                        let status = control_status(&event);
 
                         match session.handle_event(event) {
                             Ok(Some(plaintext)) => println!("{plaintext}"),
-                            Ok(None) => {}
+                            Ok(None) => {
+                                if let Some(status) = status {
+                                    eprintln!("{status}");
+                                }
+                            }
                             Err(error) => warn!(?error, "session rejected inbound event"),
                         }
                     }
@@ -114,6 +119,16 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
+fn control_status(event: &WireEvent) -> Option<String> {
+    match event {
+        WireEvent::Ack { .. } => Some("message delivered to relay".to_owned()),
+        WireEvent::Error { message, .. } => Some(format!("relay error: {message}")),
+        WireEvent::ClientHello { .. }
+        | WireEvent::PeerKey { .. }
+        | WireEvent::EncryptedMessage(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +149,24 @@ mod tests {
         assert_eq!(args.server, "ws://127.0.0.1:3000/ws");
         assert_eq!(args.id, "alice");
         assert_eq!(args.peer, "bob");
+    }
+
+    #[test]
+    fn describes_ack_as_relay_delivery_status() {
+        let status = control_status(&WireEvent::Ack {
+            message_id: chat_core::types::MessageId::new(),
+        });
+
+        assert_eq!(status, Some("message delivered to relay".to_owned()));
+    }
+
+    #[test]
+    fn describes_relay_error_status() {
+        let status = control_status(&WireEvent::Error {
+            code: "UnknownRecipient".to_owned(),
+            message: "event routing failed".to_owned(),
+        });
+
+        assert_eq!(status, Some("relay error: event routing failed".to_owned()));
     }
 }

@@ -1,0 +1,3 @@
+/target/
+/.mise.local.toml
+*.log

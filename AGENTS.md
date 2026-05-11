@@ -26,6 +26,8 @@ Use TDD for feature work. Place unit tests next to code in `#[cfg(test)] mod tes
 
 ## Commit & Pull Request Guidelines
 
+See [docs/CONVENTIONS.md](docs/CONVENTIONS.md) for the full contributor and AI-agent workflow.
+
 Use clear branch names: `<type>/<issue-number>/<title>`, for example `feature/1/workspace-setup` or `fix/12/nonce-validation`. Keep the branch type lowercase, and keep the title short, lowercase, and hyphenated.
 
 Commit subject types must be uppercase, for example `CHORE: Rust 워크스페이스 설정` or `FEAT: 암호화 세션 추가`. Commit messages must be easy to read and include this structure in the body:

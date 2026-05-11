@@ -13,7 +13,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::router::InMemoryRouter;
+use crate::router::{InMemoryRouter, RouterError};
 
 #[derive(Clone, Default)]
 struct ServerState {
@@ -74,10 +74,12 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
             continue;
         };
 
-        if let Err(error) = route_and_flush(&state, &client_id, event).await {
+        if let Err(error) = route_and_flush(&state, &client_id, event.clone()).await
+            && should_report_routing_error(&event, &error)
+        {
             let _ = event_sender.send(WireEvent::Error {
                 code: format!("{error:?}"),
-                message: "event routing failed".to_owned(),
+                message: format!("routing failed: {error:?}"),
             });
         }
     }
@@ -132,16 +134,18 @@ async fn route_and_flush(
     state: &ServerState,
     connection_id: &ClientId,
     event: WireEvent,
-) -> Result<(), ()> {
-    state
-        .router
-        .lock()
-        .await
-        .route(connection_id, event)
-        .map_err(|_| ())?;
+) -> Result<(), RouterError> {
+    state.router.lock().await.route(connection_id, event)?;
 
     flush_outboxes(state).await;
     Ok(())
+}
+
+fn should_report_routing_error(event: &WireEvent, error: &RouterError) -> bool {
+    !matches!(
+        (event, error),
+        (WireEvent::PeerKey { .. }, RouterError::UnknownRecipient)
+    )
 }
 
 async fn flush_outboxes(state: &ServerState) {
@@ -159,5 +163,43 @@ async fn flush_outboxes(state: &ServerState) {
                 let _ = sender.send(event);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::RouterError;
+    use chat_core::event::EncryptedEnvelope;
+    use chat_core::types::{Ciphertext, MessageId, NonceBytes, PublicKeyBytes};
+
+    #[test]
+    fn suppresses_unknown_recipient_error_for_peer_key_retry() {
+        let event = WireEvent::PeerKey {
+            from: ClientId::parse("alice").expect("alice"),
+            to: ClientId::parse("bob").expect("bob"),
+            public_key: PublicKeyBytes::from_array([1; 32]),
+        };
+
+        assert!(!should_report_routing_error(
+            &event,
+            &RouterError::UnknownRecipient
+        ));
+    }
+
+    #[test]
+    fn reports_unknown_recipient_error_for_encrypted_message() {
+        let event = WireEvent::EncryptedMessage(EncryptedEnvelope {
+            sender: ClientId::parse("alice").expect("alice"),
+            recipient: ClientId::parse("bob").expect("bob"),
+            message_id: MessageId::new(),
+            nonce: NonceBytes::from_array([7; 24]),
+            ciphertext: Ciphertext::from_bytes(vec![1, 2, 3]),
+        });
+
+        assert!(should_report_routing_error(
+            &event,
+            &RouterError::UnknownRecipient
+        ));
     }
 }

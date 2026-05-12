@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use chat_core::event::WireEvent;
+use chat_core::service::{MessageRouter, RouterError};
 use chat_core::types::ClientId;
 
 #[derive(Debug, Default)]
@@ -8,8 +9,8 @@ pub struct InMemoryRouter {
     outboxes: HashMap<ClientId, VecDeque<WireEvent>>,
 }
 
-impl InMemoryRouter {
-    pub fn connect(&mut self, client_id: ClientId) -> Result<(), RouterError> {
+impl MessageRouter for InMemoryRouter {
+    fn connect(&mut self, client_id: ClientId) -> Result<(), RouterError> {
         if self.outboxes.contains_key(&client_id) {
             return Err(RouterError::ClientAlreadyConnected);
         }
@@ -18,7 +19,7 @@ impl InMemoryRouter {
         Ok(())
     }
 
-    pub fn disconnect(&mut self, client_id: &ClientId) -> Result<(), RouterError> {
+    fn disconnect(&mut self, client_id: &ClientId) -> Result<(), RouterError> {
         if self.outboxes.remove(client_id).is_some() {
             Ok(())
         } else {
@@ -26,7 +27,7 @@ impl InMemoryRouter {
         }
     }
 
-    pub fn route(&mut self, connection_id: &ClientId, event: WireEvent) -> Result<(), RouterError> {
+    fn route(&mut self, connection_id: &ClientId, event: WireEvent) -> Result<(), RouterError> {
         if !self.outboxes.contains_key(connection_id) {
             return Err(RouterError::ClientNotConnected);
         }
@@ -46,22 +47,13 @@ impl InMemoryRouter {
         Ok(())
     }
 
-    pub fn drain_outbox(&mut self, client_id: &ClientId) -> Vec<WireEvent> {
+    fn drain_outbox(&mut self, client_id: &ClientId) -> Vec<WireEvent> {
         if let Some(outbox) = self.outboxes.get_mut(client_id) {
             outbox.drain(..).collect()
         } else {
             Vec::new()
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouterError {
-    ClientAlreadyConnected,
-    ClientNotConnected,
-    SenderMismatch,
-    UnknownRecipient,
-    UnsupportedEvent,
 }
 
 fn recipient_for(connection_id: &ClientId, event: &WireEvent) -> Result<ClientId, RouterError> {
@@ -225,5 +217,30 @@ mod tests {
             .expect_err("unknown recipient must fail");
 
         assert_eq!(err, RouterError::UnknownRecipient);
+    }
+
+    #[test]
+    fn in_memory_router_satisfies_message_router_contract() {
+        fn route_peer_key<R: MessageRouter>(router: &mut R) -> Result<Vec<WireEvent>, RouterError> {
+            let alice = ClientId::parse("alice").expect("alice");
+            let bob = ClientId::parse("bob").expect("bob");
+
+            router.connect(alice.clone())?;
+            router.connect(bob.clone())?;
+            router.route(
+                &alice,
+                WireEvent::PeerKey {
+                    from: alice.clone(),
+                    to: bob.clone(),
+                    public_key: PublicKeyBytes::from_array([4; 32]),
+                },
+            )?;
+            Ok(router.drain_outbox(&bob))
+        }
+
+        let mut router = InMemoryRouter::default();
+        let outbox = route_peer_key(&mut router).expect("route peer key through trait");
+
+        assert_eq!(outbox.len(), 1);
     }
 }

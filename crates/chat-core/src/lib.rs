@@ -8,6 +8,7 @@
 pub mod crypto;
 pub mod event;
 pub mod nonce;
+pub mod service;
 pub mod types;
 
 pub const PROTOCOL_VERSION: u16 = 1;

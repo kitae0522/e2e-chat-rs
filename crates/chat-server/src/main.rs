@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(test),
+    deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)
+)]
+
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 

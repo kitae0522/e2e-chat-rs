@@ -10,6 +10,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::PROTOCOL_VERSION;
 use crate::event::EncryptedEnvelope;
+use crate::nonce::NonceTracker;
 use crate::types::{Ciphertext, ClientId, MessageId, NonceBytes, PublicKeyBytes};
 
 const SESSION_KEY_SALT: &[u8] = b"e2e-chat-rs/session-key/v1";
@@ -40,6 +41,9 @@ pub struct CryptoSession {
     session_info: Vec<u8>,
     local_id: ClientId,
     peer_id: ClientId,
+    inbound_nonces: NonceTracker,
+    outbound_nonce_prefix: [u8; 16],
+    next_outbound_nonce: u64,
 }
 
 impl CryptoSession {
@@ -56,18 +60,21 @@ impl CryptoSession {
         Self {
             shared_secret: SharedSecretBytes(*shared_secret.as_bytes()),
             session_info,
+            outbound_nonce_prefix: nonce_prefix(&local_id, &peer_id),
             local_id,
             peer_id,
+            inbound_nonces: NonceTracker::default(),
+            next_outbound_nonce: 0,
         }
     }
 
     pub fn encrypt(
-        &self,
+        &mut self,
         message_id: MessageId,
-        nonce: NonceBytes,
         plaintext: &[u8],
     ) -> Result<EncryptedEnvelope, CryptoError> {
         let cipher = self.cipher()?;
+        let nonce = self.next_nonce()?;
         let aad = associated_data_for(&self.local_id, &self.peer_id, &message_id)?;
         let ciphertext = cipher
             .encrypt(
@@ -88,7 +95,7 @@ impl CryptoSession {
         })
     }
 
-    pub fn decrypt(&self, envelope: &EncryptedEnvelope) -> Result<Vec<u8>, CryptoError> {
+    pub fn decrypt(&mut self, envelope: &EncryptedEnvelope) -> Result<Vec<u8>, CryptoError> {
         if envelope.sender != self.peer_id || envelope.recipient != self.local_id {
             return Err(CryptoError::UnexpectedPeer);
         }
@@ -96,7 +103,7 @@ impl CryptoSession {
         let cipher = self.cipher()?;
         let aad = associated_data_for(&envelope.sender, &envelope.recipient, &envelope.message_id)?;
 
-        cipher
+        let plaintext = cipher
             .decrypt(
                 XNonce::from_slice(envelope.nonce.as_array()),
                 Payload {
@@ -104,7 +111,12 @@ impl CryptoSession {
                     aad: &aad,
                 },
             )
-            .map_err(|_| CryptoError::AuthenticationFailed)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+
+        self.inbound_nonces
+            .mark_seen(envelope.nonce)
+            .map_err(|_| CryptoError::DuplicateNonce)?;
+        Ok(plaintext)
     }
 
     fn cipher(&self) -> Result<XChaCha20Poly1305, CryptoError> {
@@ -117,6 +129,18 @@ impl CryptoSession {
         key.zeroize();
 
         Ok(cipher)
+    }
+
+    fn next_nonce(&mut self) -> Result<NonceBytes, CryptoError> {
+        self.next_outbound_nonce = self
+            .next_outbound_nonce
+            .checked_add(1)
+            .ok_or(CryptoError::NonceExhausted)?;
+
+        let mut nonce = [0u8; 24];
+        nonce[..16].copy_from_slice(&self.outbound_nonce_prefix);
+        nonce[16..].copy_from_slice(&self.next_outbound_nonce.to_be_bytes());
+        Ok(NonceBytes::from_array(nonce))
     }
 }
 
@@ -134,6 +158,10 @@ pub enum CryptoError {
     InvalidKeyLength,
     #[error("associated data serialization failed")]
     AssociatedDataSerializationFailed,
+    #[error("nonce counter exhausted")]
+    NonceExhausted,
+    #[error("nonce was already used in this session")]
+    DuplicateNonce,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -173,32 +201,45 @@ fn session_info(local_id: &ClientId, peer_id: &ClientId) -> Vec<u8> {
     info
 }
 
+fn nonce_prefix(local_id: &ClientId, peer_id: &ClientId) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"e2e-chat-rs/xchacha20poly1305-nonce/v1");
+    hasher.update(&[0]);
+    hasher.update(local_id.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(peer_id.as_str().as_bytes());
+
+    let hash = hasher.finalize();
+    let mut prefix = [0u8; 16];
+    prefix.copy_from_slice(&hash.as_bytes()[..16]);
+    prefix
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Ciphertext, ClientId, MessageId, NonceBytes};
+    use crate::types::{Ciphertext, ClientId, MessageId};
 
     #[test]
     fn decrypts_message_for_matching_pair() {
         let alice = KeyPair::generate();
         let bob = KeyPair::generate();
-        let alice_session = CryptoSession::new(
+        let mut alice_session = CryptoSession::new(
             &alice,
             bob.public_key(),
             ClientId::parse("alice").expect("alice"),
             ClientId::parse("bob").expect("bob"),
         );
-        let bob_session = CryptoSession::new(
+        let mut bob_session = CryptoSession::new(
             &bob,
             alice.public_key(),
             ClientId::parse("bob").expect("bob"),
             ClientId::parse("alice").expect("alice"),
         );
         let message_id = MessageId::new();
-        let nonce = NonceBytes::from_array([1; 24]);
 
         let encrypted = alice_session
-            .encrypt(message_id, nonce, b"hello bob")
+            .encrypt(message_id, b"hello bob")
             .expect("encrypt");
         let decrypted = bob_session.decrypt(&encrypted).expect("decrypt");
 
@@ -209,20 +250,20 @@ mod tests {
     fn rejects_tampered_ciphertext() {
         let alice = KeyPair::generate();
         let bob = KeyPair::generate();
-        let alice_session = CryptoSession::new(
+        let mut alice_session = CryptoSession::new(
             &alice,
             bob.public_key(),
             ClientId::parse("alice").expect("alice"),
             ClientId::parse("bob").expect("bob"),
         );
-        let bob_session = CryptoSession::new(
+        let mut bob_session = CryptoSession::new(
             &bob,
             alice.public_key(),
             ClientId::parse("bob").expect("bob"),
             ClientId::parse("alice").expect("alice"),
         );
         let mut encrypted = alice_session
-            .encrypt(MessageId::new(), NonceBytes::from_array([2; 24]), b"hello")
+            .encrypt(MessageId::new(), b"hello")
             .expect("encrypt");
 
         encrypted.ciphertext =
@@ -238,20 +279,20 @@ mod tests {
     fn rejects_tampered_message_id() {
         let alice = KeyPair::generate();
         let bob = KeyPair::generate();
-        let alice_session = CryptoSession::new(
+        let mut alice_session = CryptoSession::new(
             &alice,
             bob.public_key(),
             ClientId::parse("alice").expect("alice"),
             ClientId::parse("bob").expect("bob"),
         );
-        let bob_session = CryptoSession::new(
+        let mut bob_session = CryptoSession::new(
             &bob,
             alice.public_key(),
             ClientId::parse("bob").expect("bob"),
             ClientId::parse("alice").expect("alice"),
         );
         let mut encrypted = alice_session
-            .encrypt(MessageId::new(), NonceBytes::from_array([3; 24]), b"hello")
+            .encrypt(MessageId::new(), b"hello")
             .expect("encrypt");
 
         encrypted.message_id = MessageId::new();
@@ -267,20 +308,20 @@ mod tests {
         let alice = KeyPair::generate();
         let bob = KeyPair::generate();
         let mallory = KeyPair::generate();
-        let alice_session = CryptoSession::new(
+        let mut alice_session = CryptoSession::new(
             &alice,
             bob.public_key(),
             ClientId::parse("alice").expect("alice"),
             ClientId::parse("bob").expect("bob"),
         );
-        let bob_session_with_wrong_key = CryptoSession::new(
+        let mut bob_session_with_wrong_key = CryptoSession::new(
             &bob,
             mallory.public_key(),
             ClientId::parse("bob").expect("bob"),
             ClientId::parse("alice").expect("alice"),
         );
         let encrypted = alice_session
-            .encrypt(MessageId::new(), NonceBytes::from_array([4; 24]), b"hello")
+            .encrypt(MessageId::new(), b"hello")
             .expect("encrypt");
 
         assert_eq!(
@@ -293,20 +334,20 @@ mod tests {
     fn rejects_tampered_metadata() {
         let alice = KeyPair::generate();
         let bob = KeyPair::generate();
-        let alice_session = CryptoSession::new(
+        let mut alice_session = CryptoSession::new(
             &alice,
             bob.public_key(),
             ClientId::parse("alice").expect("alice"),
             ClientId::parse("bob").expect("bob"),
         );
-        let bob_session = CryptoSession::new(
+        let mut bob_session = CryptoSession::new(
             &bob,
             alice.public_key(),
             ClientId::parse("bob").expect("bob"),
             ClientId::parse("alice").expect("alice"),
         );
         let mut encrypted = alice_session
-            .encrypt(MessageId::new(), NonceBytes::from_array([5; 24]), b"hello")
+            .encrypt(MessageId::new(), b"hello")
             .expect("encrypt");
 
         encrypted.sender = ClientId::parse("mallory").expect("mallory");
@@ -315,5 +356,60 @@ mod tests {
             bob_session.decrypt(&encrypted),
             Err(CryptoError::UnexpectedPeer)
         );
+    }
+
+    #[test]
+    fn rejects_replayed_inbound_nonce() {
+        let alice = KeyPair::generate();
+        let bob = KeyPair::generate();
+        let mut alice_session = CryptoSession::new(
+            &alice,
+            bob.public_key(),
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let mut bob_session = CryptoSession::new(
+            &bob,
+            alice.public_key(),
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+        let encrypted = alice_session
+            .encrypt(MessageId::new(), b"hello")
+            .expect("encrypt");
+
+        bob_session.decrypt(&encrypted).expect("first decrypt");
+
+        assert_eq!(
+            bob_session.decrypt(&encrypted),
+            Err(CryptoError::DuplicateNonce)
+        );
+    }
+
+    #[test]
+    fn generates_distinct_nonces_for_each_direction() {
+        let alice = KeyPair::generate();
+        let bob = KeyPair::generate();
+        let mut alice_session = CryptoSession::new(
+            &alice,
+            bob.public_key(),
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let mut bob_session = CryptoSession::new(
+            &bob,
+            alice.public_key(),
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+
+        let from_alice = alice_session
+            .encrypt(MessageId::new(), b"hello bob")
+            .expect("encrypt alice");
+        let from_bob = bob_session
+            .encrypt(MessageId::new(), b"hello alice")
+            .expect("encrypt bob");
+
+        assert_ne!(from_alice.nonce, from_bob.nonce);
     }
 }

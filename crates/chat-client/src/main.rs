@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(test),
+    deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)
+)]
+
 use anyhow::{Context, Result, anyhow};
 use chat_client::session::{ClientSession, ClientSessionError};
 use chat_core::event::WireEvent;

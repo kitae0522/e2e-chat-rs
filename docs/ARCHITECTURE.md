@@ -13,9 +13,9 @@ That boundary makes the system easier to test and reason about.
 
 ## Crate Boundaries
 
-`chat-core` owns reusable protocol and safety logic. It defines `WireEvent`, typed values such as `ClientId`, `MessageId`, `NonceBytes`, and the crypto session.
+`chat-core` owns reusable protocol and safety logic. It defines `WireEvent`, typed values such as `ClientId`, `MessageId`, `NonceBytes`, the crypto session, and the `MessageRouter` service contract.
 
-`chat-server` owns relay behavior. It accepts WebSocket connections, registers connected clients, routes `PeerKey` and `EncryptedMessage` events, and emits `Ack` after accepting encrypted messages.
+`chat-server` owns relay behavior. It accepts WebSocket connections, registers connected clients, routes `PeerKey` and `EncryptedMessage` events through a `MessageRouter` implementation, and emits `Ack` after accepting encrypted messages. The default implementation is `InMemoryRouter`.
 
 `chat-client` owns terminal behavior. It parses CLI args, connects to the relay, reads stdin, and prints output. It delegates E2EE state to `ClientSession`.
 
@@ -52,7 +52,7 @@ This keeps v1 tiny while making the delivery boundary visible.
 - forged sender ids are rejected by the router
 - unknown encrypted-message recipients are reported to the sender
 - unknown `PeerKey` recipients are suppressed during retry
-- duplicate inbound nonces are rejected by the client session
+- duplicate inbound nonces are rejected by the crypto session
 - tampered ciphertext or authenticated metadata fails decryption
 
 ## Why Not More?

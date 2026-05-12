@@ -2,28 +2,53 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::Router;
+use axum::Router as AxumRouter;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use chat_core::event::WireEvent;
+use chat_core::service::{MessageRouter, RouterError};
 use chat_core::types::ClientId;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::router::{InMemoryRouter, RouterError};
+use crate::router::InMemoryRouter;
 
-#[derive(Clone, Default)]
-struct ServerState {
-    router: Arc<Mutex<InMemoryRouter>>,
+struct ServerState<R> {
+    router: Arc<Mutex<R>>,
     connections: Arc<Mutex<HashMap<ClientId, mpsc::UnboundedSender<WireEvent>>>>,
 }
 
+impl<R> ServerState<R> {
+    fn new(router: R) -> Self {
+        Self {
+            router: Arc::new(Mutex::new(router)),
+            connections: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<R> Clone for ServerState<R> {
+    fn clone(&self) -> Self {
+        Self {
+            router: Arc::clone(&self.router),
+            connections: Arc::clone(&self.connections),
+        }
+    }
+}
+
 pub async fn serve(listener: TcpListener) -> anyhow::Result<()> {
-    let state = ServerState::default();
-    let app = Router::new()
+    serve_with_router(listener, InMemoryRouter::default()).await
+}
+
+pub async fn serve_with_router<R>(listener: TcpListener, router: R) -> anyhow::Result<()>
+where
+    R: MessageRouter + Send + 'static,
+{
+    let state = ServerState::new(router);
+    let app = AxumRouter::new()
         .route("/ws", get(ws_handler))
         .with_state(state);
 
@@ -32,11 +57,20 @@ pub async fn serve(listener: TcpListener) -> anyhow::Result<()> {
         .context("websocket server failed")
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> impl IntoResponse {
+async fn ws_handler<R>(
+    ws: WebSocketUpgrade,
+    State(state): State<ServerState<R>>,
+) -> impl IntoResponse
+where
+    R: MessageRouter + Send + 'static,
+{
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, state: ServerState) {
+async fn handle_socket<R>(socket: WebSocket, state: ServerState<R>)
+where
+    R: MessageRouter + Send + 'static,
+{
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let Some(client_id) = read_client_hello(&mut socket_receiver).await else {
         return;
@@ -107,7 +141,7 @@ async fn read_client_hello(
 }
 
 async fn register_client(
-    state: &ServerState,
+    state: &ServerState<impl MessageRouter>,
     client_id: ClientId,
     sender: mpsc::UnboundedSender<WireEvent>,
 ) -> Result<(), ()> {
@@ -125,16 +159,22 @@ async fn register_client(
     Ok(())
 }
 
-async fn unregister_client(state: &ServerState, client_id: &ClientId) {
+async fn unregister_client<R>(state: &ServerState<R>, client_id: &ClientId)
+where
+    R: MessageRouter,
+{
     state.connections.lock().await.remove(client_id);
     let _ = state.router.lock().await.disconnect(client_id);
 }
 
-async fn route_and_flush(
-    state: &ServerState,
+async fn route_and_flush<R>(
+    state: &ServerState<R>,
     connection_id: &ClientId,
     event: WireEvent,
-) -> Result<(), RouterError> {
+) -> Result<(), RouterError>
+where
+    R: MessageRouter,
+{
     state.router.lock().await.route(connection_id, event)?;
 
     flush_outboxes(state).await;
@@ -148,11 +188,14 @@ fn should_report_routing_error(event: &WireEvent, error: &RouterError) -> bool {
     )
 }
 
-async fn flush_outboxes(state: &ServerState) {
+async fn flush_outboxes<R>(state: &ServerState<R>)
+where
+    R: MessageRouter,
+{
     let senders = state.connections.lock().await.clone();
     let deliveries = {
         let mut router = state.router.lock().await;
-        collect_outbox_deliveries(&mut router, &senders)
+        collect_outbox_deliveries(&mut *router, &senders)
     };
 
     send_outbox_deliveries(deliveries);
@@ -164,7 +207,7 @@ struct OutboxDelivery {
 }
 
 fn collect_outbox_deliveries(
-    router: &mut InMemoryRouter,
+    router: &mut impl MessageRouter,
     senders: &HashMap<ClientId, mpsc::UnboundedSender<WireEvent>>,
 ) -> Vec<OutboxDelivery> {
     senders
@@ -194,7 +237,6 @@ fn send_outbox_deliveries(deliveries: Vec<OutboxDelivery>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::router::RouterError;
     use chat_core::event::EncryptedEnvelope;
     use chat_core::types::{Ciphertext, MessageId, NonceBytes, PublicKeyBytes};
 
@@ -266,5 +308,47 @@ mod tests {
             bob_receiver.try_recv().expect("bob receives message"),
             WireEvent::EncryptedMessage(envelope)
         );
+    }
+
+    #[tokio::test]
+    async fn route_and_flush_accepts_message_router_implementation() {
+        struct RejectingRouter;
+
+        impl MessageRouter for RejectingRouter {
+            fn connect(&mut self, _client_id: ClientId) -> Result<(), RouterError> {
+                Ok(())
+            }
+
+            fn disconnect(&mut self, _client_id: &ClientId) -> Result<(), RouterError> {
+                Ok(())
+            }
+
+            fn route(
+                &mut self,
+                _connection_id: &ClientId,
+                _event: WireEvent,
+            ) -> Result<(), RouterError> {
+                Err(RouterError::UnsupportedEvent)
+            }
+
+            fn drain_outbox(&mut self, _client_id: &ClientId) -> Vec<WireEvent> {
+                Vec::new()
+            }
+        }
+
+        let state = ServerState::new(RejectingRouter);
+        let alice = ClientId::parse("alice").expect("alice");
+        let bob = ClientId::parse("bob").expect("bob");
+        let event = WireEvent::PeerKey {
+            from: alice.clone(),
+            to: bob,
+            public_key: PublicKeyBytes::from_array([4; 32]),
+        };
+
+        let err = route_and_flush(&state, &alice, event)
+            .await
+            .expect_err("custom router should reject the event");
+
+        assert_eq!(err, RouterError::UnsupportedEvent);
     }
 }

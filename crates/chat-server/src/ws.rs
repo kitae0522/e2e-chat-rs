@@ -149,19 +149,44 @@ fn should_report_routing_error(event: &WireEvent, error: &RouterError) -> bool {
 }
 
 async fn flush_outboxes(state: &ServerState) {
-    let client_ids: Vec<ClientId> = state.connections.lock().await.keys().cloned().collect();
+    let senders = state.connections.lock().await.clone();
+    let deliveries = {
+        let mut router = state.router.lock().await;
+        collect_outbox_deliveries(&mut router, &senders)
+    };
 
-    for client_id in client_ids {
-        let events = state.router.lock().await.drain_outbox(&client_id);
-        if events.is_empty() {
-            continue;
-        }
+    send_outbox_deliveries(deliveries);
+}
 
-        let sender = state.connections.lock().await.get(&client_id).cloned();
-        if let Some(sender) = sender {
-            for event in events {
-                let _ = sender.send(event);
+struct OutboxDelivery {
+    sender: mpsc::UnboundedSender<WireEvent>,
+    events: Vec<WireEvent>,
+}
+
+fn collect_outbox_deliveries(
+    router: &mut InMemoryRouter,
+    senders: &HashMap<ClientId, mpsc::UnboundedSender<WireEvent>>,
+) -> Vec<OutboxDelivery> {
+    senders
+        .iter()
+        .filter_map(|(client_id, sender)| {
+            let events = router.drain_outbox(client_id);
+            if events.is_empty() {
+                None
+            } else {
+                Some(OutboxDelivery {
+                    sender: sender.clone(),
+                    events,
+                })
             }
+        })
+        .collect()
+}
+
+fn send_outbox_deliveries(deliveries: Vec<OutboxDelivery>) {
+    for delivery in deliveries {
+        for event in delivery.events {
+            let _ = delivery.sender.send(event);
         }
     }
 }
@@ -201,5 +226,45 @@ mod tests {
             &event,
             &RouterError::UnknownRecipient
         ));
+    }
+
+    #[test]
+    fn collect_outbox_deliveries_drains_before_sending() {
+        let mut router = InMemoryRouter::default();
+        let alice = ClientId::parse("alice").expect("alice");
+        let bob = ClientId::parse("bob").expect("bob");
+        let message_id = MessageId::new();
+        let envelope = EncryptedEnvelope {
+            sender: alice.clone(),
+            recipient: bob.clone(),
+            message_id,
+            nonce: NonceBytes::from_array([9; 24]),
+            ciphertext: Ciphertext::from_bytes(vec![1, 2, 3]),
+        };
+        let (alice_sender, mut alice_receiver) = mpsc::unbounded_channel();
+        let (bob_sender, mut bob_receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(alice.clone(), alice_sender), (bob.clone(), bob_sender)]);
+
+        router.connect(alice.clone()).expect("connect alice");
+        router.connect(bob).expect("connect bob");
+        router
+            .route(&alice, WireEvent::EncryptedMessage(envelope.clone()))
+            .expect("route encrypted message");
+
+        let deliveries = collect_outbox_deliveries(&mut router, &senders);
+
+        assert!(alice_receiver.try_recv().is_err());
+        assert!(bob_receiver.try_recv().is_err());
+
+        send_outbox_deliveries(deliveries);
+
+        assert_eq!(
+            alice_receiver.try_recv().expect("alice receives ack"),
+            WireEvent::Ack { message_id }
+        );
+        assert_eq!(
+            bob_receiver.try_recv().expect("bob receives message"),
+            WireEvent::EncryptedMessage(envelope)
+        );
     }
 }

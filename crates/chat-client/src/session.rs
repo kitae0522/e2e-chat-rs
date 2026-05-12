@@ -1,15 +1,12 @@
 use chat_core::crypto::{CryptoError, CryptoSession, KeyPair};
 use chat_core::event::WireEvent;
-use chat_core::nonce::{NonceError, NonceTracker};
-use chat_core::types::{ClientId, MessageId, NonceBytes};
+use chat_core::types::{ClientId, MessageId};
 
 pub struct ClientSession {
     local_id: ClientId,
     peer_id: ClientId,
     keypair: KeyPair,
     crypto_session: Option<CryptoSession>,
-    inbound_nonces: NonceTracker,
-    next_outbound_nonce: u64,
 }
 
 impl ClientSession {
@@ -19,8 +16,6 @@ impl ClientSession {
             peer_id,
             keypair: KeyPair::generate(),
             crypto_session: None,
-            inbound_nonces: NonceTracker::default(),
-            next_outbound_nonce: 0,
         }
     }
 
@@ -65,10 +60,9 @@ impl ClientSession {
             WireEvent::EncryptedMessage(envelope) => {
                 let session = self
                     .crypto_session
-                    .as_ref()
+                    .as_mut()
                     .ok_or(ClientSessionError::MissingPeerKey)?;
                 let plaintext = session.decrypt(&envelope)?;
-                self.inbound_nonces.mark_seen(envelope.nonce)?;
                 let message =
                     String::from_utf8(plaintext).map_err(|_| ClientSessionError::InvalidUtf8)?;
 
@@ -81,28 +75,13 @@ impl ClientSession {
     }
 
     pub fn encrypt_line(&mut self, line: &str) -> Result<WireEvent, ClientSessionError> {
-        if self.crypto_session.is_none() {
-            return Err(ClientSessionError::MissingPeerKey);
-        }
-
-        let nonce = self.next_nonce()?;
-        let Some(session) = self.crypto_session.as_ref() else {
-            return Err(ClientSessionError::MissingPeerKey);
-        };
-        let envelope = session.encrypt(MessageId::new(), nonce, line.as_bytes())?;
+        let session = self
+            .crypto_session
+            .as_mut()
+            .ok_or(ClientSessionError::MissingPeerKey)?;
+        let envelope = session.encrypt(MessageId::new(), line.as_bytes())?;
 
         Ok(WireEvent::EncryptedMessage(envelope))
-    }
-
-    fn next_nonce(&mut self) -> Result<NonceBytes, ClientSessionError> {
-        self.next_outbound_nonce = self
-            .next_outbound_nonce
-            .checked_add(1)
-            .ok_or(ClientSessionError::NonceExhausted)?;
-
-        let mut nonce = [0u8; 24];
-        nonce[16..].copy_from_slice(&self.next_outbound_nonce.to_be_bytes());
-        Ok(NonceBytes::from_array(nonce))
     }
 }
 
@@ -110,21 +89,13 @@ impl ClientSession {
 pub enum ClientSessionError {
     MissingPeerKey,
     UnexpectedPeerKey,
-    NonceExhausted,
     InvalidUtf8,
     Crypto(CryptoError),
-    Nonce(NonceError),
 }
 
 impl From<CryptoError> for ClientSessionError {
     fn from(error: CryptoError) -> Self {
         Self::Crypto(error)
-    }
-}
-
-impl From<NonceError> for ClientSessionError {
-    fn from(error: NonceError) -> Self {
-        Self::Nonce(error)
     }
 }
 

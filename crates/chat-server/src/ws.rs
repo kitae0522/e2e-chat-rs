@@ -8,7 +8,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use chat_core::event::WireEvent;
-use chat_core::service::{MessageRouter, RouterError};
+use chat_core::service::{EventHook, MessageRouter, NoopEventHook, RouterError};
 use chat_core::types::ClientId;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -16,24 +16,27 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::router::InMemoryRouter;
 
-struct ServerState<R> {
+struct ServerState<R, H> {
     router: Arc<Mutex<R>>,
+    hook: Arc<Mutex<H>>,
     connections: Arc<Mutex<HashMap<ClientId, mpsc::UnboundedSender<WireEvent>>>>,
 }
 
-impl<R> ServerState<R> {
-    fn new(router: R) -> Self {
+impl<R, H> ServerState<R, H> {
+    fn new(router: R, hook: H) -> Self {
         Self {
             router: Arc::new(Mutex::new(router)),
+            hook: Arc::new(Mutex::new(hook)),
             connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
-impl<R> Clone for ServerState<R> {
+impl<R, H> Clone for ServerState<R, H> {
     fn clone(&self) -> Self {
         Self {
             router: Arc::clone(&self.router),
+            hook: Arc::clone(&self.hook),
             connections: Arc::clone(&self.connections),
         }
     }
@@ -47,7 +50,19 @@ pub async fn serve_with_router<R>(listener: TcpListener, router: R) -> anyhow::R
 where
     R: MessageRouter + Send + 'static,
 {
-    let state = ServerState::new(router);
+    serve_with_router_and_hook(listener, router, NoopEventHook).await
+}
+
+pub async fn serve_with_router_and_hook<R, H>(
+    listener: TcpListener,
+    router: R,
+    hook: H,
+) -> anyhow::Result<()>
+where
+    R: MessageRouter + Send + 'static,
+    H: EventHook + Send + 'static,
+{
+    let state = ServerState::new(router, hook);
     let app = AxumRouter::new()
         .route("/ws", get(ws_handler))
         .with_state(state);
@@ -57,19 +72,21 @@ where
         .context("websocket server failed")
 }
 
-async fn ws_handler<R>(
+async fn ws_handler<R, H>(
     ws: WebSocketUpgrade,
-    State(state): State<ServerState<R>>,
+    State(state): State<ServerState<R, H>>,
 ) -> impl IntoResponse
 where
     R: MessageRouter + Send + 'static,
+    H: EventHook + Send + 'static,
 {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket<R>(socket: WebSocket, state: ServerState<R>)
+async fn handle_socket<R, H>(socket: WebSocket, state: ServerState<R, H>)
 where
     R: MessageRouter + Send + 'static,
+    H: EventHook + Send + 'static,
 {
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let Some(client_id) = read_client_hello(&mut socket_receiver).await else {
@@ -140,11 +157,15 @@ async fn read_client_hello(
     None
 }
 
-async fn register_client(
-    state: &ServerState<impl MessageRouter>,
+async fn register_client<R, H>(
+    state: &ServerState<R, H>,
     client_id: ClientId,
     sender: mpsc::UnboundedSender<WireEvent>,
-) -> Result<(), ()> {
+) -> Result<(), ()>
+where
+    R: MessageRouter,
+    H: EventHook,
+{
     if state
         .router
         .lock()
@@ -155,27 +176,60 @@ async fn register_client(
         return Err(());
     }
 
-    state.connections.lock().await.insert(client_id, sender);
+    state
+        .connections
+        .lock()
+        .await
+        .insert(client_id.clone(), sender);
+    state.hook.lock().await.on_connect(&client_id);
     Ok(())
 }
 
-async fn unregister_client<R>(state: &ServerState<R>, client_id: &ClientId)
+async fn unregister_client<R, H>(state: &ServerState<R, H>, client_id: &ClientId)
 where
     R: MessageRouter,
+    H: EventHook,
 {
     state.connections.lock().await.remove(client_id);
-    let _ = state.router.lock().await.disconnect(client_id);
+    if state.router.lock().await.disconnect(client_id).is_ok() {
+        state.hook.lock().await.on_disconnect(client_id);
+    }
 }
 
-async fn route_and_flush<R>(
-    state: &ServerState<R>,
+async fn route_and_flush<R, H>(
+    state: &ServerState<R, H>,
     connection_id: &ClientId,
     event: WireEvent,
 ) -> Result<(), RouterError>
 where
     R: MessageRouter,
+    H: EventHook,
 {
-    state.router.lock().await.route(connection_id, event)?;
+    let route_result = {
+        state
+            .router
+            .lock()
+            .await
+            .route(connection_id, event.clone())
+    };
+
+    match route_result {
+        Ok(()) => {
+            state
+                .hook
+                .lock()
+                .await
+                .on_route_accepted(connection_id, &event);
+        }
+        Err(error) => {
+            state
+                .hook
+                .lock()
+                .await
+                .on_route_rejected(connection_id, &event, &error);
+            return Err(error);
+        }
+    }
 
     flush_outboxes(state).await;
     Ok(())
@@ -188,9 +242,10 @@ fn should_report_routing_error(event: &WireEvent, error: &RouterError) -> bool {
     )
 }
 
-async fn flush_outboxes<R>(state: &ServerState<R>)
+async fn flush_outboxes<R, H>(state: &ServerState<R, H>)
 where
     R: MessageRouter,
+    H: EventHook,
 {
     let senders = state.connections.lock().await.clone();
     let deliveries = {
@@ -239,6 +294,7 @@ mod tests {
     use super::*;
     use chat_core::event::EncryptedEnvelope;
     use chat_core::types::{Ciphertext, MessageId, NonceBytes, PublicKeyBytes};
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn suppresses_unknown_recipient_error_for_peer_key_retry() {
@@ -336,7 +392,7 @@ mod tests {
             }
         }
 
-        let state = ServerState::new(RejectingRouter);
+        let state = ServerState::new(RejectingRouter, NoopEventHook);
         let alice = ClientId::parse("alice").expect("alice");
         let bob = ClientId::parse("bob").expect("bob");
         let event = WireEvent::PeerKey {
@@ -350,5 +406,153 @@ mod tests {
             .expect_err("custom router should reject the event");
 
         assert_eq!(err, RouterError::UnsupportedEvent);
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct RecordingHook {
+        calls: Vec<&'static str>,
+    }
+
+    impl EventHook for RecordingHook {
+        fn on_connect(&mut self, _client_id: &ClientId) {
+            self.calls.push("connect");
+        }
+
+        fn on_disconnect(&mut self, _client_id: &ClientId) {
+            self.calls.push("disconnect");
+        }
+
+        fn on_route_accepted(&mut self, _connection_id: &ClientId, _event: &WireEvent) {
+            self.calls.push("route_accepted");
+        }
+
+        fn on_route_rejected(
+            &mut self,
+            _connection_id: &ClientId,
+            _event: &WireEvent,
+            _error: &RouterError,
+        ) {
+            self.calls.push("route_rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn event_hook_observes_connection_lifecycle() {
+        let state = ServerState::new(InMemoryRouter::default(), RecordingHook::default());
+        let alice = ClientId::parse("alice").expect("alice");
+        let (sender, _receiver) = mpsc::unbounded_channel();
+
+        register_client(&state, alice.clone(), sender)
+            .await
+            .expect("register alice");
+        unregister_client(&state, &alice).await;
+
+        let hook = state.hook.lock().await;
+
+        assert_eq!(hook.calls, vec!["connect", "disconnect"]);
+    }
+
+    #[tokio::test]
+    async fn event_hook_observes_route_success_and_error() {
+        let state = ServerState::new(InMemoryRouter::default(), RecordingHook::default());
+        let alice = ClientId::parse("alice").expect("alice");
+        let bob = ClientId::parse("bob").expect("bob");
+        let mallory = ClientId::parse("mallory").expect("mallory");
+        let (alice_sender, _alice_receiver) = mpsc::unbounded_channel();
+        let (bob_sender, _bob_receiver) = mpsc::unbounded_channel();
+
+        register_client(&state, alice.clone(), alice_sender)
+            .await
+            .expect("register alice");
+        register_client(&state, bob.clone(), bob_sender)
+            .await
+            .expect("register bob");
+
+        route_and_flush(
+            &state,
+            &alice,
+            WireEvent::PeerKey {
+                from: alice.clone(),
+                to: bob.clone(),
+                public_key: PublicKeyBytes::from_array([4; 32]),
+            },
+        )
+        .await
+        .expect("route peer key");
+
+        let err = route_and_flush(
+            &state,
+            &alice,
+            WireEvent::PeerKey {
+                from: mallory,
+                to: bob,
+                public_key: PublicKeyBytes::from_array([5; 32]),
+            },
+        )
+        .await
+        .expect_err("forged route should fail");
+
+        let hook = state.hook.lock().await;
+
+        assert_eq!(err, RouterError::SenderMismatch);
+        assert_eq!(
+            hook.calls,
+            vec!["connect", "connect", "route_accepted", "route_rejected"]
+        );
+    }
+
+    #[tokio::test]
+    async fn event_hook_runs_after_router_lock_is_released() {
+        struct RouterLockProbeHook {
+            router: Arc<Mutex<InMemoryRouter>>,
+            observations: Arc<StdMutex<Vec<bool>>>,
+        }
+
+        impl EventHook for RouterLockProbeHook {
+            fn on_route_accepted(&mut self, _connection_id: &ClientId, _event: &WireEvent) {
+                self.observations
+                    .lock()
+                    .expect("record observations")
+                    .push(self.router.try_lock().is_ok());
+            }
+        }
+
+        let router = Arc::new(Mutex::new(InMemoryRouter::default()));
+        let observations = Arc::new(StdMutex::new(Vec::new()));
+        let state = ServerState {
+            router: Arc::clone(&router),
+            hook: Arc::new(Mutex::new(RouterLockProbeHook {
+                router,
+                observations: Arc::clone(&observations),
+            })),
+            connections: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let alice = ClientId::parse("alice").expect("alice");
+        let bob = ClientId::parse("bob").expect("bob");
+        let (alice_sender, _alice_receiver) = mpsc::unbounded_channel();
+        let (bob_sender, _bob_receiver) = mpsc::unbounded_channel();
+
+        register_client(&state, alice.clone(), alice_sender)
+            .await
+            .expect("register alice");
+        register_client(&state, bob.clone(), bob_sender)
+            .await
+            .expect("register bob");
+
+        route_and_flush(
+            &state,
+            &alice,
+            WireEvent::PeerKey {
+                from: alice.clone(),
+                to: bob,
+                public_key: PublicKeyBytes::from_array([6; 32]),
+            },
+        )
+        .await
+        .expect("route peer key");
+
+        let observations = observations.lock().expect("read observations");
+
+        assert_eq!(*observations, vec![true]);
     }
 }

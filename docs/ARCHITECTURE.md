@@ -13,9 +13,9 @@ That boundary makes the system easier to test and reason about.
 
 ## Crate Boundaries
 
-`chat-core` owns reusable protocol and safety logic. It defines `WireEvent`, typed values such as `ClientId`, `MessageId`, `NonceBytes`, the crypto session, and the `MessageRouter` service contract.
+`chat-core` owns reusable protocol and safety logic. It defines `WireEvent`, typed values such as `ClientId`, `MessageId`, `NonceBytes`, the crypto session, the `MessageRouter` service contract, and the `EventHook` observation contract.
 
-`chat-server` owns relay behavior. It accepts WebSocket connections, registers connected clients, routes `PeerKey` and `EncryptedMessage` events through a `MessageRouter` implementation, and emits `Ack` after accepting encrypted messages. The default implementation is `InMemoryRouter`.
+`chat-server` owns relay behavior. It accepts WebSocket connections, registers connected clients, routes `PeerKey` and `EncryptedMessage` events through a `MessageRouter` implementation, emits `Ack` after accepting encrypted messages, and can notify an `EventHook` implementation about connection and route outcomes. The default router is `InMemoryRouter`, and the default hook is no-op.
 
 `chat-client` owns terminal behavior. It parses CLI args, connects to the relay, reads stdin, and prints output. It delegates E2EE state to `ClientSession`.
 
@@ -46,6 +46,13 @@ It never receives plaintext. Decryption happens only inside the receiving client
 `Ack` means the relay accepted an encrypted message for a connected recipient. It does not mean the recipient read the message, stored the message, or can recover it after disconnect.
 
 This keeps v1 tiny while making the delivery boundary visible.
+
+## Extension Points
+
+`MessageRouter` decides how connected clients and outboxes are managed.
+`EventHook` observes successful connects, disconnects, accepted routes, and rejected routes.
+
+Hooks are observational only. They do not authorize, reject, store, mutate, or retry events. Auth and persistence are separate future boundaries.
 
 ## Safety Checks
 

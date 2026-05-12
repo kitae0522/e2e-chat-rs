@@ -1,20 +1,110 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## Project Identity
 
-This Rust workspace keeps production crates under `crates/`: `crates/chat-core` for protocol and crypto, `crates/chat-server` for the event-driven relay, and `crates/chat-client` for the tiny CLI client. Keep reusable docs in `docs/`, architecture notes in `docs/ARCHITECTURE.md`, and decision notes in `docs/checkpoints/`.
+`e2e-chat-rs` is a Rust workspace implementing a 1:1 E2EE chat relay.
+Long-term goal: become a reusable framework crate for E2EE services.
 
-## Build, Test, and Development Commands
+```
+crates/
+  chat-core/    # protocol, crypto, trait definitions
+  chat-server/  # axum + tokio WebSocket relay
+  chat-client/  # CLI adapter
+docs/
+  checkpoints/  # milestone decision records
+  superpowers/  # plans and specs for Codex agents
+```
+
+Checkpoint docs are for milestone decisions or architecture, security, protocol, and workflow boundaries. Do not add a checkpoint for routine documentation edits or small localized fixes.
+
+## Toolchain
 
 Use `mise` for the Rust toolchain and project tasks. After `mise.toml` is added, use:
 
-- `mise install`: install the pinned Rust toolchain and components.
-- `mise run check`: type-check the workspace.
-- `mise run test`: run unit and integration tests.
-- `mise run fmt-fix`: format Rust code.
-- `mise run verify`: run format, check, clippy, and tests.
+```bash
+mise install                    # install pinned Rust toolchain
+mise run check                  # type-check workspace
+mise run test                   # run all tests
+mise run fmt-fix                # format code
+mise run verify                 # fmt + check + clippy + test (run before every PR)
+```
 
-Avoid adding Docker, databases, or service dependencies until the E2EE relay needs them.
+Always run `mise run verify` before marking a task done.
+If `mise` is unavailable, fall back to `cargo check && cargo test`.
+
+## Behavioral Rules
+
+### Rule 1 — Think Before Coding
+State assumptions explicitly before writing any code.
+If a simpler approach exists, say so before implementing the complex one.
+Ask when ambiguous. Do not guess silently.
+If you encounter a design decision not covered by this file, stop and ask.
+
+### Rule 2 — Simplicity First
+Write the minimum code that solves the problem.
+No speculative features, no abstractions for single-use code.
+Test: would a senior Rust engineer say this is overcomplicated? If yes, simplify.
+
+### Rule 3 — Surgical Changes
+Touch only what the issue requires.
+Do not improve adjacent code, fix unrelated style, or refactor what isn't broken.
+Do not add features beyond the issue scope.
+Match existing code style exactly.
+
+### Rule 4 — Read Before You Write
+Before adding code to an existing file, read:
+- The file's public API and type signatures
+- The immediate caller of the code you are changing
+- Any shared types in `chat-core` that the code depends on
+  If you do not understand why existing code is structured a certain way, say so.
+  "Looks orthogonal to me" is not sufficient justification for not reading it.
+
+### Rule 5 — Surface Conflicts, Don't Average Them
+If two patterns in the codebase contradict (e.g. two error handling styles),
+pick the more recent or more tested one, explain why, and flag the other for cleanup.
+Do not write code that blends both patterns.
+Averaging conflicting patterns produces the worst code.
+
+### Rule 6 — Tests Verify Intent
+Write failing tests before writing implementation (TDD).
+Every test must encode WHY the behavior matters, not just WHAT it returns.
+Name tests by behavior: `rejects_tampered_ciphertext`, not `test_encrypt`.
+A test that cannot fail when business logic changes is wrong.
+
+### Rule 7 — Commit Granularity
+Make a separate commit after each meaningful step.
+Each commit must leave the workspace in a buildable, test-passing state.
+Do not batch all changes into a single commit at the end.
+Commit format: see Commit Convention section below.
+
+### Rule 8 — Fail Loud
+Do not say "done" if anything was skipped, broken, or unverified.
+If a test was skipped, say why.
+If `mise run verify` was not run, say so.
+Surface uncertainty in the PR description rather than hiding it.
+
+## Policy: Security
+
+Do not commit secrets, tokens, private keys, or certificates.
+Do not introduce `unwrap()` or `expect()` in non-test code without a comment explaining why a panic is acceptable.
+Zeroize all key material. If adding a new key type, implement `ZeroizeOnDrop`.
+AAD must bind: version + sender + recipient + message_id.
+Do not change the wire format (`WireEvent`, `EncryptedEnvelope`) without a documented migration path.
+
+## Policy: Error Handling
+
+Use typed error enums, not `anyhow` in library code (`chat-core`).
+`anyhow` is acceptable in binary crates (`chat-server`, `chat-client`) for operational errors.
+Every error variant must have a distinct name that describes the failure reason.
+Do not use `String` as an error type.
+
+## Out of Scope (do not do without explicit instruction)
+
+- Do not add Docker, databases, or external service dependencies
+- Do not introduce `async-trait` unless the trait is already async in the codebase
+- Do not change `Cargo.toml` dependency versions without asking
+- Do not add new crates to the workspace without asking
+- Do not rename public types in `chat-core` without asking (breaking change)
 
 ## Coding Style & Naming Conventions
 
@@ -30,20 +120,20 @@ See [docs/CONVENTIONS.md](docs/CONVENTIONS.md) for the full contributor and AI-a
 
 Use clear branch names: `<type>/<issue-number>/<title>`, for example `feature/1/workspace-setup` or `fix/12/nonce-validation`. Keep the branch type lowercase, and keep the title short, lowercase, and hyphenated.
 
-Commit subject types must be uppercase, for example `CHORE: Rust 워크스페이스 설정` or `FEAT: 암호화 세션 추가`. Commit messages must be easy to read and include this structure in the body:
+Commit subject types must be uppercase, for example `CHORE: Configure Rust workspace` or `FEAT: Add crypto session`. Commit messages must be easy to read and include these exact Korean field labels in the body:
 
-- `어떤 작업을 했는가`: the work category or scope.
-- `어떤 이슈인가`: the related issue or problem.
-- `그래서 무엇을 했는가`: the concrete change.
+- `어떤 작업을 했는가`: work category or scope.
+- `어떤 이슈인가`: related issue or problem.
+- `그래서 무엇을 했는가`: concrete change.
 
 Example:
 
 ```text
-CHORE: Rust 워크스페이스 설정
+CHORE: Configure Rust workspace
 
-- 어떤 작업을 했는가: Rust 프로젝트 초기 설정
-- 어떤 이슈인가: #1 E2E 채팅 v1 구현 준비
-- 그래서 무엇을 했는가: mise, Cargo workspace, 기본 크레이트 구조 추가
+- 어떤 작업을 했는가: Rust project setup
+- 어떤 이슈인가: #1 Prepare E2E chat v1 implementation
+- 그래서 무엇을 했는가: Add mise, Cargo workspace, and base crate structure
 ```
 
 Pull requests must use the repository PR template and be written in Korean. Merge PRs with rebase and fast-forward only; avoid merge commits.

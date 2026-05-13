@@ -1,11 +1,12 @@
 use chat_core::crypto::{CryptoError, CryptoSession, KeyPair};
 use chat_core::event::WireEvent;
-use chat_core::types::{ClientId, MessageId};
+use chat_core::types::{ClientId, MessageId, PublicKeyBytes};
 
 pub struct ClientSession {
     local_id: ClientId,
     peer_id: ClientId,
     keypair: KeyPair,
+    peer_public_key: Option<PublicKeyBytes>,
     crypto_session: Option<CryptoSession>,
 }
 
@@ -15,6 +16,7 @@ impl ClientSession {
             local_id,
             peer_id,
             keypair: KeyPair::generate(),
+            peer_public_key: None,
             crypto_session: None,
         }
     }
@@ -48,7 +50,15 @@ impl ClientSession {
                 if from != self.peer_id || to != self.local_id {
                     return Err(ClientSessionError::UnexpectedPeerKey);
                 }
+                if let Some(peer_public_key) = self.peer_public_key {
+                    if peer_public_key == public_key {
+                        return Ok(None);
+                    }
 
+                    return Err(ClientSessionError::UnexpectedPeerKey);
+                }
+
+                self.peer_public_key = Some(public_key);
                 self.crypto_session = Some(CryptoSession::new(
                     &self.keypair,
                     public_key,
@@ -155,5 +165,53 @@ mod tests {
         alice.handle_event(bob.peer_key_event()).expect("bob key");
 
         assert!(alice.is_ready());
+    }
+
+    #[test]
+    fn keeps_replay_protection_after_duplicate_peer_key() {
+        let mut alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let mut bob = ClientSession::new(
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+        let alice_key = alice.peer_key_event();
+
+        bob.handle_event(alice_key.clone()).expect("alice key");
+        alice.handle_event(bob.peer_key_event()).expect("bob key");
+        let event = alice.encrypt_line("hello bob").expect("encrypt");
+        bob.handle_event(event.clone()).expect("first decrypt");
+
+        bob.handle_event(alice_key).expect("duplicate peer key");
+
+        assert_eq!(
+            bob.handle_event(event),
+            Err(ClientSessionError::Crypto(CryptoError::DuplicateNonce))
+        );
+    }
+
+    #[test]
+    fn rejects_changed_peer_key_after_session_ready() {
+        let alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let mallory_as_alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let mut bob = ClientSession::new(
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+
+        bob.handle_event(alice.peer_key_event()).expect("alice key");
+
+        assert_eq!(
+            bob.handle_event(mallory_as_alice.peer_key_event()),
+            Err(ClientSessionError::UnexpectedPeerKey)
+        );
     }
 }

@@ -59,6 +59,8 @@ Hooks are observational only. They do not authorize, reject, store, mutate, or r
 - forged sender ids are rejected by the router
 - unknown encrypted-message recipients are reported to the sender
 - unknown `PeerKey` recipients are suppressed during retry
+- duplicate `PeerKey` events do not reset an established client crypto session
+- changed peer keys are rejected until an explicit rekey protocol exists
 - duplicate inbound nonces are rejected by the crypto session
 - tampered ciphertext or authenticated metadata fails decryption
 

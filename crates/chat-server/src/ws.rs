@@ -231,7 +231,8 @@ where
         }
     }
 
-    flush_outboxes(state).await;
+    let targets = delivery_targets(connection_id, &event);
+    flush_outboxes(state, &targets).await;
     Ok(())
 }
 
@@ -242,16 +243,40 @@ fn should_report_routing_error(event: &WireEvent, error: &RouterError) -> bool {
     )
 }
 
-async fn flush_outboxes<R, H>(state: &ServerState<R, H>)
+fn delivery_targets(connection_id: &ClientId, event: &WireEvent) -> Vec<ClientId> {
+    match event {
+        WireEvent::PeerKey { to, .. } => vec![to.clone()],
+        WireEvent::EncryptedMessage(envelope) => {
+            vec![envelope.recipient.clone(), connection_id.clone()]
+        }
+        WireEvent::ClientHello { .. } | WireEvent::Ack { .. } | WireEvent::Error { .. } => {
+            Vec::new()
+        }
+    }
+}
+
+async fn flush_outboxes<R, H>(state: &ServerState<R, H>, targets: &[ClientId])
 where
     R: MessageRouter,
     H: EventHook,
 {
-    let senders = state.connections.lock().await.clone();
-    let deliveries = {
+    let mut deliveries = Vec::new();
+    {
         let mut router = state.router.lock().await;
-        collect_outbox_deliveries(&mut *router, &senders)
-    };
+        let connections = state.connections.lock().await;
+        for client_id in targets {
+            let Some(sender) = connections.get(client_id) else {
+                continue;
+            };
+            let events = router.drain_outbox(client_id);
+            if !events.is_empty() {
+                deliveries.push(OutboxDelivery {
+                    sender: sender.clone(),
+                    events,
+                });
+            }
+        }
+    }
 
     send_outbox_deliveries(deliveries);
 }
@@ -259,26 +284,6 @@ where
 struct OutboxDelivery {
     sender: mpsc::UnboundedSender<WireEvent>,
     events: Vec<WireEvent>,
-}
-
-fn collect_outbox_deliveries(
-    router: &mut impl MessageRouter,
-    senders: &HashMap<ClientId, mpsc::UnboundedSender<WireEvent>>,
-) -> Vec<OutboxDelivery> {
-    senders
-        .iter()
-        .filter_map(|(client_id, sender)| {
-            let events = router.drain_outbox(client_id);
-            if events.is_empty() {
-                None
-            } else {
-                Some(OutboxDelivery {
-                    sender: sender.clone(),
-                    events,
-                })
-            }
-        })
-        .collect()
 }
 
 fn send_outbox_deliveries(deliveries: Vec<OutboxDelivery>) {
@@ -326,46 +331,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn collect_outbox_deliveries_drains_before_sending() {
-        let mut router = InMemoryRouter::default();
-        let alice = ClientId::parse("alice").expect("alice");
-        let bob = ClientId::parse("bob").expect("bob");
-        let message_id = MessageId::new();
-        let envelope = EncryptedEnvelope {
-            sender: alice.clone(),
-            recipient: bob.clone(),
-            message_id,
-            nonce: NonceBytes::from_array([9; 24]),
-            ciphertext: Ciphertext::from_bytes(vec![1, 2, 3]),
-        };
-        let (alice_sender, mut alice_receiver) = mpsc::unbounded_channel();
-        let (bob_sender, mut bob_receiver) = mpsc::unbounded_channel();
-        let senders = HashMap::from([(alice.clone(), alice_sender), (bob.clone(), bob_sender)]);
-
-        router.connect(alice.clone()).expect("connect alice");
-        router.connect(bob).expect("connect bob");
-        router
-            .route(&alice, WireEvent::EncryptedMessage(envelope.clone()))
-            .expect("route encrypted message");
-
-        let deliveries = collect_outbox_deliveries(&mut router, &senders);
-
-        assert!(alice_receiver.try_recv().is_err());
-        assert!(bob_receiver.try_recv().is_err());
-
-        send_outbox_deliveries(deliveries);
-
-        assert_eq!(
-            alice_receiver.try_recv().expect("alice receives ack"),
-            WireEvent::Ack { message_id }
-        );
-        assert_eq!(
-            bob_receiver.try_recv().expect("bob receives message"),
-            WireEvent::EncryptedMessage(envelope)
-        );
-    }
-
     #[tokio::test]
     async fn route_and_flush_accepts_message_router_implementation() {
         struct RejectingRouter;
@@ -406,6 +371,103 @@ mod tests {
             .expect_err("custom router should reject the event");
 
         assert_eq!(err, RouterError::UnsupportedEvent);
+    }
+
+    #[test]
+    fn delivery_targets_cover_recipient_and_ack_sender() {
+        let alice = ClientId::parse("alice").expect("alice");
+        let bob = ClientId::parse("bob").expect("bob");
+
+        let peer_key_targets = delivery_targets(
+            &alice,
+            &WireEvent::PeerKey {
+                from: alice.clone(),
+                to: bob.clone(),
+                public_key: PublicKeyBytes::from_array([4; 32]),
+            },
+        );
+
+        assert_eq!(peer_key_targets, vec![bob.clone()]);
+
+        let message_targets = delivery_targets(
+            &alice,
+            &WireEvent::EncryptedMessage(EncryptedEnvelope {
+                sender: alice.clone(),
+                recipient: bob.clone(),
+                message_id: MessageId::new(),
+                nonce: NonceBytes::from_array([7; 24]),
+                ciphertext: Ciphertext::from_bytes(vec![1, 2, 3]),
+            }),
+        );
+
+        // 수신자와 Ack를 받는 발신자 모두 대상이다.
+        assert_eq!(message_targets, vec![bob, alice]);
+    }
+
+    #[tokio::test]
+    async fn flush_outboxes_drains_only_target_clients() {
+        let state = ServerState::new(InMemoryRouter::default(), NoopEventHook);
+        let alice = ClientId::parse("alice").expect("alice");
+        let bob = ClientId::parse("bob").expect("bob");
+        let carol = ClientId::parse("carol").expect("carol");
+        let (alice_sender, mut alice_receiver) = mpsc::unbounded_channel();
+        let (bob_sender, mut bob_receiver) = mpsc::unbounded_channel();
+        let (carol_sender, mut carol_receiver) = mpsc::unbounded_channel();
+
+        register_client(&state, alice.clone(), alice_sender)
+            .await
+            .expect("register alice");
+        register_client(&state, bob.clone(), bob_sender)
+            .await
+            .expect("register bob");
+        register_client(&state, carol.clone(), carol_sender)
+            .await
+            .expect("register carol");
+
+        // carol의 outbox를 flush 대상 외부에서 미리 적재한다.
+        // (alice→carol 메시지는 carol의 outbox에만 이벤트를 남긴다.)
+        state
+            .router
+            .lock()
+            .await
+            .route(
+                &alice,
+                WireEvent::EncryptedMessage(EncryptedEnvelope {
+                    sender: alice.clone(),
+                    recipient: carol.clone(),
+                    message_id: MessageId::new(),
+                    nonce: NonceBytes::from_array([1; 24]),
+                    ciphertext: Ciphertext::from_bytes(vec![9, 9, 9]),
+                }),
+            )
+            .expect("seed carol outbox");
+
+        let event = WireEvent::PeerKey {
+            from: alice.clone(),
+            to: bob.clone(),
+            public_key: PublicKeyBytes::from_array([4; 32]),
+        };
+
+        state
+            .router
+            .lock()
+            .await
+            .route(&alice, event.clone())
+            .expect("route peer key");
+        let targets = delivery_targets(&alice, &event);
+
+        flush_outboxes(&state, &targets).await;
+
+        assert!(matches!(
+            bob_receiver.try_recv().expect("bob receives peer key"),
+            WireEvent::PeerKey { .. }
+        ));
+        // 대상 외 클라이언트의 outbox는 건드리지 않는다.
+        assert!(alice_receiver.try_recv().is_err());
+        assert!(carol_receiver.try_recv().is_err());
+        let mut router = state.router.lock().await;
+
+        assert_eq!(router.drain_outbox(&carol).len(), 1);
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]

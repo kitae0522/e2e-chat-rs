@@ -54,7 +54,9 @@ async fn run(args: Args) -> Result<()> {
     loop {
         tokio::select! {
             _ = peer_key_retry.tick() => {
-                send_event(&mut writer, &session.peer_key_event()).await?;
+                if should_retry_peer_key(session.is_ready()) {
+                    send_event(&mut writer, &session.peer_key_event()).await?;
+                }
             }
             line = lines.next_line() => {
                 let Some(line) = line.context("read stdin line")? else {
@@ -86,6 +88,7 @@ async fn run(args: Args) -> Result<()> {
                         let event = serde_json::from_str::<WireEvent>(payload.as_ref())
                             .context("decode websocket event")?;
                         let status = control_status(&event);
+                        let reply_peer_key = needs_peer_key_reply(session.is_ready(), &event);
 
                         match session.handle_event(event) {
                             Ok(Some(plaintext)) => println!("{plaintext}"),
@@ -94,7 +97,16 @@ async fn run(args: Args) -> Result<()> {
                                     eprintln!("{status}");
                                 }
                             }
-                            Err(error) => warn!(?error, "session rejected inbound event"),
+                            Err(error) => {
+                                warn!(?error, "session rejected inbound event");
+                                continue;
+                            }
+                        }
+
+                        // 초기 PeerKey가 유실된 피어를 살리기 위해,
+                        // 세션 ready로 전환되는 최초 수신에 자신의 키로 응답한다.
+                        if reply_peer_key {
+                            send_event(&mut writer, &session.peer_key_event()).await?;
                         }
                     }
                     Message::Close(_) => break,
@@ -122,6 +134,14 @@ where
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+fn should_retry_peer_key(is_ready: bool) -> bool {
+    !is_ready
+}
+
+fn needs_peer_key_reply(was_ready: bool, event: &WireEvent) -> bool {
+    !was_ready && matches!(event, WireEvent::PeerKey { .. })
 }
 
 fn control_status(event: &WireEvent) -> Option<String> {
@@ -163,6 +183,31 @@ mod tests {
         });
 
         assert_eq!(status, Some("message delivered to relay".to_owned()));
+    }
+
+    #[test]
+    fn retries_peer_key_only_while_session_is_not_ready() {
+        // ready 후 재전송을 멈춰야 불필요한 트래픽이 사라진다.
+        assert!(should_retry_peer_key(false));
+        assert!(!should_retry_peer_key(true));
+    }
+
+    #[test]
+    fn replies_with_own_peer_key_to_first_inbound_peer_key() {
+        // 초기 PeerKey가 유실된 피어를 살리기 위해,
+        // ready로 전환되는 최초 수신에만 자신의 키로 응답한다.
+        let peer_key = WireEvent::PeerKey {
+            from: ClientId::parse("bob").expect("bob"),
+            to: ClientId::parse("alice").expect("alice"),
+            public_key: chat_core::types::PublicKeyBytes::from_array([3; 32]),
+        };
+        let ack = WireEvent::Ack {
+            message_id: chat_core::types::MessageId::new(),
+        };
+
+        assert!(needs_peer_key_reply(false, &peer_key));
+        assert!(!needs_peer_key_reply(true, &peer_key));
+        assert!(!needs_peer_key_reply(false, &ack));
     }
 
     #[test]

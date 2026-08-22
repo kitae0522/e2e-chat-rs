@@ -64,6 +64,26 @@ Hooks are observational only. They do not authorize, reject, store, mutate, or r
 - duplicate inbound nonces are rejected by the crypto session
 - tampered ciphertext or authenticated metadata fails decryption
 
+## Known Limitations
+
+These are accepted v1 boundaries, but they become real risks once the related
+features are attempted. They are recorded so that future work starts from an
+honest baseline.
+
+- **No peer authentication.** The `PeerKey` exchange is unauthenticated, and a
+  client accepts the first key it receives for its peer. A man-in-the-middle
+  can substitute keys without detection. Fingerprint verification is tracked
+  in issue #21.
+- **Nonce reuse if static keys persist.** Outbound nonces use an in-memory
+  counter that starts at zero, while the session key derives from a long-term
+  X25519 shared secret. If keypairs are ever persisted across restarts, the
+  counter resets but the key does not, which reuses nonces under the same AEAD
+  key. Any key persistence feature must redesign nonce management first.
+- **Offline messages are silently lost.** The relay stores nothing. Messages
+  routed to a disconnected recipient fail with `UnknownRecipient`, and outbox
+  contents are dropped when a client disconnects. Reliable delivery requires
+  an explicit persistence or reconnect design.
+
 ## Why Not More?
 
 No accounts, persistence, reconnect protocol, group chat, or rich UI are included in v1. Those features are useful later, but they would hide the core lessons: typed protocol events, explicit state machines, and E2EE boundaries.

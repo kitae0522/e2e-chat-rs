@@ -1,3 +1,7 @@
 /target/
 /.mise.local.toml
 *.log
+/.idea/
+/.codegraph/
+/.pi/
+/docs/img.png

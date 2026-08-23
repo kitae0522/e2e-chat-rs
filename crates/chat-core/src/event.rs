@@ -157,10 +157,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_client_id() {
-        let err = ClientId::parse(" ").expect_err("empty id must fail");
+    fn rejects_blank_client_id() {
+        let err = ClientId::parse(" ").expect_err("blank id must fail");
 
-        assert_eq!(err, TypeError::EmptyClientId);
+        assert_eq!(err, TypeError::ClientIdInvalidCharacter);
     }
 
     #[test]

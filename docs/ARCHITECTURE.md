@@ -54,6 +54,16 @@ This keeps v1 tiny while making the delivery boundary visible.
 
 Hooks are observational only. They do not authorize, reject, store, mutate, or retry events. Auth and persistence are separate future boundaries.
 
+## Client Identity Policy
+
+`ClientId` is a protocol-sensitive value: it routes envelopes and is bound into
+AEAD associated data. Validation rejects rather than normalizes, so the id on
+the wire always matches the id every peer saw.
+
+- 1 to 64 characters
+- ASCII letters, digits, `-`, `_`, `.` only
+- no whitespace, control characters, or non-ASCII characters
+
 ## Safety Checks
 
 - forged sender ids are rejected by the router

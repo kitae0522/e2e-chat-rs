@@ -469,6 +469,7 @@ mod tests {
             sender: ClientId::parse("alice").expect("alice"),
             recipient: ClientId::parse("bob").expect("bob"),
             message_id: MessageId::new(),
+            epoch: 0,
             nonce: NonceBytes::from_array([7; 24]),
             ciphertext: Ciphertext::from_bytes(vec![1, 2, 3]),
         });
@@ -543,6 +544,7 @@ mod tests {
                 sender: alice.clone(),
                 recipient: bob.clone(),
                 message_id: MessageId::new(),
+                epoch: 0,
                 nonce: NonceBytes::from_array([7; 24]),
                 ciphertext: Ciphertext::from_bytes(vec![1, 2, 3]),
             }),
@@ -608,6 +610,7 @@ mod tests {
                     sender: alice.clone(),
                     recipient: carol.clone(),
                     message_id: MessageId::new(),
+                    epoch: 0,
                     nonce: NonceBytes::from_array([1; 24]),
                     ciphertext: Ciphertext::from_bytes(vec![9, 9, 9]),
                 }),

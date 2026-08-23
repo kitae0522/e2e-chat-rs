@@ -4,6 +4,7 @@ use hkdf::Hkdf;
 use rand_core::OsRng;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -55,9 +56,11 @@ pub struct CryptoSession {
     session_info: Vec<u8>,
     local_id: ClientId,
     peer_id: ClientId,
-    inbound_nonces: NonceTracker,
+    inbound_nonces: HashMap<u32, NonceTracker>,
     outbound_nonce_prefix: [u8; 16],
     next_outbound_nonce: u64,
+    /// Session key generation for outbound encryption.
+    epoch: u32,
 }
 
 impl CryptoSession {
@@ -77,9 +80,23 @@ impl CryptoSession {
             outbound_nonce_prefix: nonce_prefix(&local_id, &peer_id),
             local_id,
             peer_id,
-            inbound_nonces: NonceTracker::default(),
+            inbound_nonces: HashMap::new(),
             next_outbound_nonce: 0,
+            epoch: 0,
         }
+    }
+
+    /// Current session key generation for outbound encryption.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bump_epoch_for_test(&mut self) {
+        self.epoch += 1;
+        // 전환기 수신자는 현재 + 바로 이전 epoch만 추적한다.
+        self.inbound_nonces
+            .retain(|generation, _| *generation + 1 >= self.epoch);
     }
 
     pub fn encrypt(
@@ -87,9 +104,9 @@ impl CryptoSession {
         message_id: MessageId,
         plaintext: &[u8],
     ) -> Result<EncryptedEnvelope, CryptoError> {
-        let cipher = self.cipher()?;
+        let cipher = self.cipher_for(self.epoch)?;
         let nonce = self.next_nonce()?;
-        let aad = associated_data_for(&self.local_id, &self.peer_id, &message_id)?;
+        let aad = associated_data_for(&self.local_id, &self.peer_id, &message_id, self.epoch)?;
         let ciphertext = cipher
             .encrypt(
                 XNonce::from_slice(nonce.as_array()),
@@ -104,6 +121,7 @@ impl CryptoSession {
             sender: self.local_id.clone(),
             recipient: self.peer_id.clone(),
             message_id,
+            epoch: self.epoch,
             nonce,
             ciphertext: Ciphertext::from_bytes(ciphertext),
         })
@@ -114,8 +132,20 @@ impl CryptoSession {
             return Err(CryptoError::UnexpectedPeer);
         }
 
-        let cipher = self.cipher()?;
-        let aad = associated_data_for(&envelope.sender, &envelope.recipient, &envelope.message_id)?;
+        // 전환기 동안 현재와 바로 이전 epoch만 수용한다.
+        let is_current = envelope.epoch == self.epoch;
+        let is_previous = self.epoch > 0 && envelope.epoch + 1 == self.epoch;
+        if !is_current && !is_previous {
+            return Err(CryptoError::UnknownEpoch);
+        }
+
+        let cipher = self.cipher_for(envelope.epoch)?;
+        let aad = associated_data_for(
+            &envelope.sender,
+            &envelope.recipient,
+            &envelope.message_id,
+            envelope.epoch,
+        )?;
 
         let plaintext = cipher
             .decrypt(
@@ -128,15 +158,19 @@ impl CryptoSession {
             .map_err(|_| CryptoError::AuthenticationFailed)?;
 
         self.inbound_nonces
+            .entry(envelope.epoch)
+            .or_default()
             .mark_seen(envelope.nonce)
             .map_err(|_| CryptoError::DuplicateNonce)?;
         Ok(plaintext)
     }
 
-    fn cipher(&self) -> Result<XChaCha20Poly1305, CryptoError> {
+    fn cipher_for(&self, epoch: u32) -> Result<XChaCha20Poly1305, CryptoError> {
         let hkdf = Hkdf::<Sha256>::new(Some(SESSION_KEY_SALT), &self.shared_secret.0);
+        let mut info = self.session_info.clone();
+        info.extend_from_slice(&epoch.to_be_bytes());
         let mut key = [0u8; 32];
-        hkdf.expand(&self.session_info, &mut key)
+        hkdf.expand(&info, &mut key)
             .map_err(|_| CryptoError::KeyDerivationFailed)?;
         let cipher =
             XChaCha20Poly1305::new_from_slice(&key).map_err(|_| CryptoError::InvalidKeyLength)?;
@@ -164,6 +198,8 @@ pub enum CryptoError {
     AuthenticationFailed,
     #[error("envelope sender or recipient does not match this session")]
     UnexpectedPeer,
+    #[error("envelope epoch is neither the current nor the previous session generation")]
+    UnknownEpoch,
     #[error("encryption failed")]
     EncryptionFailed,
     #[error("session key derivation failed")]
@@ -187,18 +223,21 @@ struct AssociatedData<'a> {
     sender: &'a ClientId,
     recipient: &'a ClientId,
     message_id: &'a MessageId,
+    epoch: u32,
 }
 
 fn associated_data_for(
     sender: &ClientId,
     recipient: &ClientId,
     message_id: &MessageId,
+    epoch: u32,
 ) -> Result<Vec<u8>, CryptoError> {
     serde_json::to_vec(&AssociatedData {
         version: PROTOCOL_VERSION,
         sender,
         recipient,
         message_id,
+        epoch,
     })
     .map_err(|_| CryptoError::AssociatedDataSerializationFailed)
 }
@@ -250,6 +289,80 @@ mod tests {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
         assert_ne!(first, fingerprint(&PublicKeyBytes::from_array([8; 32])));
+    }
+
+    #[test]
+    fn binds_epoch_into_associated_data() {
+        // epoch는 AAD에 바인딩된다: 이전 epoch 메시지의 epoch 필드를 바꾸면
+        // 해당 epoch 키로 복호화가 실패해야 한다.
+        let alice = KeyPair::generate();
+        let bob = KeyPair::generate();
+        let mut alice_session = test_session(&alice, &bob, "alice", "bob");
+        let mut bob_session = test_session(&bob, &alice, "bob", "alice");
+        let envelope = alice_session
+            .encrypt(MessageId::new(), b"hi")
+            .expect("encrypt");
+        assert_eq!(envelope.epoch, 0);
+
+        // 양쪽 모두 재키 전환으로 epoch를 올린다.
+        alice_session.bump_epoch_for_test();
+        bob_session.bump_epoch_for_test();
+
+        bob_session
+            .decrypt(&envelope)
+            .expect("accept previous epoch");
+
+        let mut tampered = envelope.clone();
+        tampered.epoch += 1;
+        assert_eq!(
+            bob_session.decrypt(&tampered),
+            Err(CryptoError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn accepts_previous_epoch_only_during_transition() {
+        // 전환기 수신자는 현재 + 바로 이전 epoch만 수용한다.
+        let alice = KeyPair::generate();
+        let bob = KeyPair::generate();
+        let mut alice_session = test_session(&alice, &bob, "alice", "bob");
+        let mut bob_session = test_session(&bob, &alice, "bob", "alice");
+        let old_envelope = alice_session
+            .encrypt(MessageId::new(), b"old")
+            .expect("encrypt old epoch");
+
+        // 양쪽 모두 epoch를 올린 뒤 새 epoch 메시지를 만든다.
+        alice_session.bump_epoch_for_test();
+        bob_session.bump_epoch_for_test();
+        let new_envelope = alice_session
+            .encrypt(MessageId::new(), b"new")
+            .expect("encrypt new epoch");
+
+        assert_eq!(new_envelope.epoch, old_envelope.epoch + 1);
+        bob_session
+            .decrypt(&new_envelope)
+            .expect("accept new epoch");
+        bob_session
+            .decrypt(&old_envelope)
+            .expect("accept previous epoch");
+
+        let mut future = new_envelope.clone();
+        future.epoch += 2;
+        assert_eq!(bob_session.decrypt(&future), Err(CryptoError::UnknownEpoch));
+    }
+
+    fn test_session(
+        local: &KeyPair,
+        peer: &KeyPair,
+        local_id: &str,
+        peer_id: &str,
+    ) -> CryptoSession {
+        CryptoSession::new(
+            local,
+            peer.public_key(),
+            ClientId::parse(local_id).expect("local id"),
+            ClientId::parse(peer_id).expect("peer id"),
+        )
     }
 
     #[test]

@@ -43,14 +43,14 @@ impl<R, H> Clone for ServerState<R, H> {
 }
 
 pub async fn serve(listener: TcpListener) -> anyhow::Result<()> {
-    serve_with_router(listener, InMemoryRouter::default()).await
+    WsServer::new(listener).run().await
 }
 
 pub async fn serve_with_router<R>(listener: TcpListener, router: R) -> anyhow::Result<()>
 where
     R: MessageRouter + Send + 'static,
 {
-    serve_with_router_and_hook(listener, router, NoopEventHook).await
+    WsServer::new(listener).with_router(router).run().await
 }
 
 pub async fn serve_with_router_and_hook<R, H>(
@@ -62,14 +62,71 @@ where
     R: MessageRouter + Send + 'static,
     H: EventHook + Send + 'static,
 {
-    let state = ServerState::new(router, hook);
-    let app = AxumRouter::new()
-        .route("/ws", get(ws_handler))
-        .with_state(state);
-
-    axum::serve(listener, app)
+    WsServer::new(listener)
+        .with_router(router)
+        .with_hook(hook)
+        .run()
         .await
-        .context("websocket server failed")
+}
+
+/// Builder for the WebSocket relay server.
+///
+/// Defaults to [`InMemoryRouter`] and [`NoopEventHook`]; extension points such
+/// as routers, hooks, and future auth providers are injected by chaining
+/// `with_*` methods instead of growing `serve*` function signatures.
+pub struct WsServer<R = InMemoryRouter, H = NoopEventHook> {
+    listener: TcpListener,
+    router: R,
+    hook: H,
+}
+
+impl WsServer {
+    pub fn new(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            router: InMemoryRouter::default(),
+            hook: NoopEventHook,
+        }
+    }
+}
+
+impl<R, H> WsServer<R, H> {
+    pub fn with_router<R2>(self, router: R2) -> WsServer<R2, H>
+    where
+        R2: MessageRouter,
+    {
+        WsServer {
+            listener: self.listener,
+            router,
+            hook: self.hook,
+        }
+    }
+
+    pub fn with_hook<H2>(self, hook: H2) -> WsServer<R, H2>
+    where
+        H2: EventHook,
+    {
+        WsServer {
+            listener: self.listener,
+            router: self.router,
+            hook,
+        }
+    }
+
+    pub async fn run(self) -> anyhow::Result<()>
+    where
+        R: MessageRouter + Send + 'static,
+        H: EventHook + Send + 'static,
+    {
+        let state = ServerState::new(self.router, self.hook);
+        let app = AxumRouter::new()
+            .route("/ws", get(ws_handler))
+            .with_state(state);
+
+        axum::serve(self.listener, app)
+            .await
+            .context("websocket server failed")
+    }
 }
 
 async fn ws_handler<R, H>(

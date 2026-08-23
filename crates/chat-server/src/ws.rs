@@ -8,7 +8,9 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use chat_core::event::WireEvent;
-use chat_core::service::{EventHook, MessageRouter, NoopEventHook, RouterError};
+use chat_core::service::{
+    AuthError, AuthProvider, EventHook, MessageRouter, NoopAuthProvider, NoopEventHook, RouterError,
+};
 use chat_core::types::ClientId;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -16,27 +18,30 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::router::InMemoryRouter;
 
-struct ServerState<R, H> {
+struct ServerState<R, H, A> {
     router: Arc<Mutex<R>>,
     hook: Arc<Mutex<H>>,
+    auth: Arc<Mutex<A>>,
     connections: Arc<Mutex<HashMap<ClientId, mpsc::UnboundedSender<WireEvent>>>>,
 }
 
-impl<R, H> ServerState<R, H> {
-    fn new(router: R, hook: H) -> Self {
+impl<R, H, A> ServerState<R, H, A> {
+    fn new(router: R, hook: H, auth: A) -> Self {
         Self {
             router: Arc::new(Mutex::new(router)),
             hook: Arc::new(Mutex::new(hook)),
+            auth: Arc::new(Mutex::new(auth)),
             connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
-impl<R, H> Clone for ServerState<R, H> {
+impl<R, H, A> Clone for ServerState<R, H, A> {
     fn clone(&self) -> Self {
         Self {
             router: Arc::clone(&self.router),
             hook: Arc::clone(&self.hook),
+            auth: Arc::clone(&self.auth),
             connections: Arc::clone(&self.connections),
         }
     }
@@ -71,13 +76,15 @@ where
 
 /// Builder for the WebSocket relay server.
 ///
-/// Defaults to [`InMemoryRouter`] and [`NoopEventHook`]; extension points such
-/// as routers, hooks, and future auth providers are injected by chaining
-/// `with_*` methods instead of growing `serve*` function signatures.
-pub struct WsServer<R = InMemoryRouter, H = NoopEventHook> {
+/// Defaults to [`InMemoryRouter`], [`NoopEventHook`], and [`NoopAuthProvider`];
+/// extension points such as routers, hooks, auth providers, and future storage
+/// boundaries are injected by chaining `with_*` methods instead of growing
+/// `serve*` function signatures.
+pub struct WsServer<R = InMemoryRouter, H = NoopEventHook, A = NoopAuthProvider> {
     listener: TcpListener,
     router: R,
     hook: H,
+    auth: A,
 }
 
 impl WsServer {
@@ -86,12 +93,13 @@ impl WsServer {
             listener,
             router: InMemoryRouter::default(),
             hook: NoopEventHook,
+            auth: NoopAuthProvider,
         }
     }
 }
 
-impl<R, H> WsServer<R, H> {
-    pub fn with_router<R2>(self, router: R2) -> WsServer<R2, H>
+impl<R, H, A> WsServer<R, H, A> {
+    pub fn with_router<R2>(self, router: R2) -> WsServer<R2, H, A>
     where
         R2: MessageRouter,
     {
@@ -99,10 +107,11 @@ impl<R, H> WsServer<R, H> {
             listener: self.listener,
             router,
             hook: self.hook,
+            auth: self.auth,
         }
     }
 
-    pub fn with_hook<H2>(self, hook: H2) -> WsServer<R, H2>
+    pub fn with_hook<H2>(self, hook: H2) -> WsServer<R, H2, A>
     where
         H2: EventHook,
     {
@@ -110,6 +119,19 @@ impl<R, H> WsServer<R, H> {
             listener: self.listener,
             router: self.router,
             hook,
+            auth: self.auth,
+        }
+    }
+
+    pub fn with_auth_provider<A2>(self, auth: A2) -> WsServer<R, H, A2>
+    where
+        A2: AuthProvider,
+    {
+        WsServer {
+            listener: self.listener,
+            router: self.router,
+            hook: self.hook,
+            auth,
         }
     }
 
@@ -117,8 +139,9 @@ impl<R, H> WsServer<R, H> {
     where
         R: MessageRouter + Send + 'static,
         H: EventHook + Send + 'static,
+        A: AuthProvider + Send + 'static,
     {
-        let state = ServerState::new(self.router, self.hook);
+        let state = ServerState::new(self.router, self.hook, self.auth);
         let app = AxumRouter::new()
             .route("/ws", get(ws_handler))
             .with_state(state);
@@ -129,26 +152,33 @@ impl<R, H> WsServer<R, H> {
     }
 }
 
-async fn ws_handler<R, H>(
+async fn ws_handler<R, H, A>(
     ws: WebSocketUpgrade,
-    State(state): State<ServerState<R, H>>,
+    State(state): State<ServerState<R, H, A>>,
 ) -> impl IntoResponse
 where
     R: MessageRouter + Send + 'static,
     H: EventHook + Send + 'static,
+    A: AuthProvider + Send + 'static,
 {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket<R, H>(socket: WebSocket, state: ServerState<R, H>)
+async fn handle_socket<R, H, A>(socket: WebSocket, state: ServerState<R, H, A>)
 where
     R: MessageRouter + Send + 'static,
     H: EventHook + Send + 'static,
+    A: AuthProvider + Send + 'static,
 {
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let Some(client_id) = read_client_hello(&mut socket_receiver).await else {
         return;
     };
+
+    if let Err(error) = state.auth.lock().await.authorize_connect(&client_id) {
+        reject_connection(&mut socket_sender, &error).await;
+        return;
+    }
 
     let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
     if register_client(&state, client_id.clone(), event_sender.clone())
@@ -196,6 +226,20 @@ where
     writer.abort();
 }
 
+/// Sends an Error wire event for denied connections before closing the socket.
+async fn reject_connection(
+    socket_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    error: &AuthError,
+) {
+    let rejection = WireEvent::Error {
+        code: format!("{error:?}"),
+        message: format!("connect rejected: {error}"),
+    };
+    if let Ok(text) = serde_json::to_string(&rejection) {
+        let _ = socket_sender.send(Message::Text(text.into())).await;
+    }
+}
+
 async fn read_client_hello(
     socket_receiver: &mut futures::stream::SplitStream<WebSocket>,
 ) -> Option<ClientId> {
@@ -214,8 +258,8 @@ async fn read_client_hello(
     None
 }
 
-async fn register_client<R, H>(
-    state: &ServerState<R, H>,
+async fn register_client<R, H, A>(
+    state: &ServerState<R, H, A>,
     client_id: ClientId,
     sender: mpsc::UnboundedSender<WireEvent>,
 ) -> Result<(), ()>
@@ -242,7 +286,7 @@ where
     Ok(())
 }
 
-async fn unregister_client<R, H>(state: &ServerState<R, H>, client_id: &ClientId)
+async fn unregister_client<R, H, A>(state: &ServerState<R, H, A>, client_id: &ClientId)
 where
     R: MessageRouter,
     H: EventHook,
@@ -253,8 +297,8 @@ where
     }
 }
 
-async fn route_and_flush<R, H>(
-    state: &ServerState<R, H>,
+async fn route_and_flush<R, H, A>(
+    state: &ServerState<R, H, A>,
     connection_id: &ClientId,
     event: WireEvent,
 ) -> Result<(), RouterError>
@@ -312,7 +356,7 @@ fn delivery_targets(connection_id: &ClientId, event: &WireEvent) -> Vec<ClientId
     }
 }
 
-async fn flush_outboxes<R, H>(state: &ServerState<R, H>, targets: &[ClientId])
+async fn flush_outboxes<R, H, A>(state: &ServerState<R, H, A>, targets: &[ClientId])
 where
     R: MessageRouter,
     H: EventHook,
@@ -414,7 +458,7 @@ mod tests {
             }
         }
 
-        let state = ServerState::new(RejectingRouter, NoopEventHook);
+        let state = ServerState::new(RejectingRouter, NoopEventHook, NoopAuthProvider);
         let alice = ClientId::parse("alice").expect("alice");
         let bob = ClientId::parse("bob").expect("bob");
         let event = WireEvent::PeerKey {
@@ -463,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_outboxes_drains_only_target_clients() {
-        let state = ServerState::new(InMemoryRouter::default(), NoopEventHook);
+        let state = ServerState::new(InMemoryRouter::default(), NoopEventHook, NoopAuthProvider);
         let alice = ClientId::parse("alice").expect("alice");
         let bob = ClientId::parse("bob").expect("bob");
         let carol = ClientId::parse("carol").expect("carol");
@@ -557,7 +601,11 @@ mod tests {
 
     #[tokio::test]
     async fn event_hook_observes_connection_lifecycle() {
-        let state = ServerState::new(InMemoryRouter::default(), RecordingHook::default());
+        let state = ServerState::new(
+            InMemoryRouter::default(),
+            RecordingHook::default(),
+            NoopAuthProvider,
+        );
         let alice = ClientId::parse("alice").expect("alice");
         let (sender, _receiver) = mpsc::unbounded_channel();
 
@@ -573,7 +621,11 @@ mod tests {
 
     #[tokio::test]
     async fn event_hook_observes_route_success_and_error() {
-        let state = ServerState::new(InMemoryRouter::default(), RecordingHook::default());
+        let state = ServerState::new(
+            InMemoryRouter::default(),
+            RecordingHook::default(),
+            NoopAuthProvider,
+        );
         let alice = ClientId::parse("alice").expect("alice");
         let bob = ClientId::parse("bob").expect("bob");
         let mallory = ClientId::parse("mallory").expect("mallory");
@@ -644,6 +696,7 @@ mod tests {
                 router,
                 observations: Arc::clone(&observations),
             })),
+            auth: Arc::new(Mutex::new(NoopAuthProvider)),
             connections: Arc::new(Mutex::new(HashMap::new())),
         };
         let alice = ClientId::parse("alice").expect("alice");

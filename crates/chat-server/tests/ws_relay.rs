@@ -243,15 +243,29 @@ async fn builder_injects_custom_hook_observing_lifecycle() -> anyhow::Result<()>
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let hook = SharedHook::default();
-    let server =
-        tokio::spawn(async move { WsServer::new(listener).with_hook(hook.clone()).run().await });
+    let hook_for_server = hook.clone();
+    let server = tokio::spawn(async move {
+        WsServer::new(listener)
+            .with_hook(hook_for_server)
+            .run()
+            .await
+    });
 
     let (mut alice, _) = connect_async(format!("ws://{addr}/ws")).await?;
+    let (mut bob, _) = connect_async(format!("ws://{addr}/ws")).await?;
     send_event(
         &mut alice,
         &WireEvent::ClientHello {
             client_id: ClientId::parse("alice")?,
             public_key: PublicKeyBytes::from_array([1; 32]),
+        },
+    )
+    .await?;
+    send_event(
+        &mut bob,
+        &WireEvent::ClientHello {
+            client_id: ClientId::parse("bob")?,
+            public_key: PublicKeyBytes::from_array([2; 32]),
         },
     )
     .await?;
@@ -269,7 +283,18 @@ async fn builder_injects_custom_hook_observing_lifecycle() -> anyhow::Result<()>
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     drop(alice);
-    wait_for_calls(&hook, &["connect", "route_accepted", "disconnect"]).await;
+    drop(bob);
+    wait_for_calls(
+        &hook,
+        &[
+            "connect",
+            "connect",
+            "route_accepted",
+            "disconnect",
+            "disconnect",
+        ],
+    )
+    .await;
 
     server.abort();
     Ok(())

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use chat_core::crypto::{CryptoSession, KeyPair};
 use chat_core::event::WireEvent;
-use chat_core::service::{EventHook, MessageRouter, RouterError};
+use chat_core::service::{AuthError, AuthProvider, EventHook, MessageRouter, RouterError};
 use chat_core::types::{Ciphertext, ClientId, MessageId, NonceBytes, PublicKeyBytes};
 use chat_server::ws::WsServer;
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -353,6 +353,43 @@ async fn builder_injects_custom_router_and_reports_rejection() -> anyhow::Result
             nonce: NonceBytes::from_array([7; 24]),
             ciphertext: Ciphertext::from_bytes(vec![1, 2, 3]),
         }),
+    )
+    .await?;
+
+    let received_event = receive_event(&mut alice).await?;
+
+    assert!(matches!(received_event, WireEvent::Error { .. }));
+
+    server.abort();
+    Ok(())
+}
+
+struct DenyAllAuthProvider;
+
+impl AuthProvider for DenyAllAuthProvider {
+    fn authorize_connect(&mut self, _client_id: &ClientId) -> Result<(), AuthError> {
+        Err(AuthError::ConnectDenied)
+    }
+}
+
+#[tokio::test]
+async fn builder_injects_auth_provider_and_rejects_denied_clients() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        WsServer::new(listener)
+            .with_auth_provider(DenyAllAuthProvider)
+            .run()
+            .await
+    });
+
+    let (mut alice, _) = connect_async(format!("ws://{addr}/ws")).await?;
+    send_event(
+        &mut alice,
+        &WireEvent::ClientHello {
+            client_id: ClientId::parse("alice")?,
+            public_key: PublicKeyBytes::from_array([1; 32]),
+        },
     )
     .await?;
 

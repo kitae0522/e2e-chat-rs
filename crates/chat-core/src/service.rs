@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::event::WireEvent;
+use crate::event::{RelayErrorCode, WireEvent};
 use crate::types::ClientId;
 
 pub trait MessageRouter {
@@ -65,4 +65,60 @@ pub enum RouterError {
     UnknownRecipient,
     #[error("event type is not routable")]
     UnsupportedEvent,
+}
+
+impl From<&RouterError> for RelayErrorCode {
+    fn from(error: &RouterError) -> Self {
+        match error {
+            RouterError::SenderMismatch => Self::SenderMismatch,
+            RouterError::UnknownRecipient => Self::UnknownRecipient,
+            RouterError::UnsupportedEvent => Self::UnsupportedEvent,
+            RouterError::ClientNotConnected => Self::ClientNotConnected,
+            RouterError::ClientAlreadyConnected => Self::ClientAlreadyConnected,
+        }
+    }
+}
+
+impl From<&AuthError> for RelayErrorCode {
+    fn from(_error: &AuthError) -> Self {
+        Self::ConnectDenied
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_router_errors_to_wire_codes() {
+        // 라우터 에러는 와이어 코드로 손실 없이 대응되어야 한다.
+        assert_eq!(
+            RelayErrorCode::from(&RouterError::SenderMismatch),
+            RelayErrorCode::SenderMismatch
+        );
+        assert_eq!(
+            RelayErrorCode::from(&RouterError::UnknownRecipient),
+            RelayErrorCode::UnknownRecipient
+        );
+        assert_eq!(
+            RelayErrorCode::from(&RouterError::UnsupportedEvent),
+            RelayErrorCode::UnsupportedEvent
+        );
+        assert_eq!(
+            RelayErrorCode::from(&RouterError::ClientNotConnected),
+            RelayErrorCode::ClientNotConnected
+        );
+        assert_eq!(
+            RelayErrorCode::from(&RouterError::ClientAlreadyConnected),
+            RelayErrorCode::ClientAlreadyConnected
+        );
+    }
+
+    #[test]
+    fn maps_auth_denial_to_connect_denied_code() {
+        assert_eq!(
+            RelayErrorCode::from(&AuthError::ConnectDenied),
+            RelayErrorCode::ConnectDenied
+        );
+    }
 }

@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use chat_core::event::WireEvent;
+use chat_core::event::{RelayErrorCode, WireEvent};
 use chat_core::service::{
     AuthError, AuthProvider, EventHook, MessageRouter, NoopAuthProvider, NoopEventHook, RouterError,
 };
@@ -216,7 +216,7 @@ where
             && should_report_routing_error(&event, &error)
         {
             let _ = event_sender.send(WireEvent::Error {
-                code: format!("{error:?}"),
+                code: RelayErrorCode::from(&error),
                 message: format!("routing failed: {error:?}"),
             });
         }
@@ -232,7 +232,7 @@ async fn reject_connection(
     error: &AuthError,
 ) {
     let rejection = WireEvent::Error {
-        code: format!("{error:?}"),
+        code: RelayErrorCode::from(error),
         message: format!("connect rejected: {error}"),
     };
     if let Ok(text) = serde_json::to_string(&rejection) {

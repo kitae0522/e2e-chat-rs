@@ -213,10 +213,20 @@ mod tests {
     #[test]
     fn describes_relay_error_status() {
         let status = control_status(&WireEvent::Error {
-            code: "UnknownRecipient".to_owned(),
+            code: chat_core::event::RelayErrorCode::UnknownRecipient,
             message: "event routing failed".to_owned(),
         });
 
         assert_eq!(status, Some("relay error: event routing failed".to_owned()));
+    }
+
+    #[test]
+    fn describes_relay_error_with_unknown_code_from_newer_peer() {
+        let status = control_status(&WireEvent::Error {
+            code: chat_core::event::RelayErrorCode::Other("rekey_required".to_owned()),
+            message: "rekey needed".to_owned(),
+        });
+
+        assert_eq!(status, Some("relay error: rekey needed".to_owned()));
     }
 }

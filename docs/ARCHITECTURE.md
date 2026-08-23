@@ -65,6 +65,18 @@ media transfer is out of scope for v1 and must revisit these limits.
   outbox is full, the relay closes that connection instead of dropping events
   silently.
 
+## Wire Serialization Policy
+
+Byte-carrying wire fields (`PublicKeyBytes`, `NonceBytes`, `Ciphertext`) are
+encoded as standard-alphabet base64 strings inside the JSON events — not JSON
+number arrays, which cost roughly twice the encoded size.
+
+- Encoding: `base64::engine::general_purpose::STANDARD` (with padding)
+- Decoding rejects invalid base64 and wrong decoded lengths
+- The transport stays JSON over WebSocket text frames; a binary/Protobuf
+  transport is a deliberate future migration and must be documented as a wire
+  format change when attempted.
+
 ## Client Identity Policy
 
 `ClientId` is a protocol-sensitive value: it routes envelopes and is bound into

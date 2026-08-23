@@ -351,6 +351,7 @@ async fn builder_injects_custom_router_and_reports_rejection() -> anyhow::Result
             sender: alice_id,
             recipient: bob_id,
             message_id: MessageId::new(),
+            epoch: 0,
             nonce: NonceBytes::from_array([7; 24]),
             ciphertext: Ciphertext::from_bytes(vec![1, 2, 3]),
         }),

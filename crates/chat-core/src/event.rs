@@ -7,6 +7,10 @@ pub struct EncryptedEnvelope {
     pub sender: ClientId,
     pub recipient: ClientId,
     pub message_id: MessageId,
+    /// Session key generation this envelope was encrypted under.
+    /// Bound into the AEAD associated data; receivers accept the current
+    /// and immediately previous epoch during a rekey transition.
+    pub epoch: u32,
     pub nonce: NonceBytes,
     pub ciphertext: Ciphertext,
 }
@@ -106,6 +110,7 @@ mod tests {
             sender: ClientId::parse("alice").expect("valid sender"),
             recipient: ClientId::parse("bob").expect("valid recipient"),
             message_id: MessageId::new(),
+            epoch: 0,
             nonce: NonceBytes::from_array([7; 24]),
             ciphertext: Ciphertext::from_bytes(vec![1, 2, 3, 4]),
         });

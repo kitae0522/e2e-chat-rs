@@ -15,6 +15,6 @@ body:
   - type: textarea
     attributes:
       label: "🌏 Environment"
-      placeholder: "OS: macOS 14\nTypescript: latest\nbun: latest"
+      placeholder: "OS: macOS 14\nRust: 1.95.0 (mise)"
     validations:
       required: true

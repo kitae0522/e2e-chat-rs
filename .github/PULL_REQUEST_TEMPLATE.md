@@ -6,8 +6,7 @@
 - [ ] Change 2
 
 ## 🧪 Test Results
-- Backend: `cd backend && bun run test` — ✅ X passed, Y% coverage
-- Frontend: `cd frontend && bun run check` — ✅ No errors
+- Backend: `mise run verify` — ✅ fmt + check + clippy + test 통과
 
 ## 📋 Review Report
 <!-- Paste code-reviewer agent output here -->

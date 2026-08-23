@@ -71,6 +71,8 @@ mise run verify
 
 Use TDD for feature work. Keep milestones small and record decisions in `docs/checkpoints/`.
 
+Pull requests run the same suite in CI via GitHub Actions (`.github/workflows/verify.yml`); local `mise run verify` must pass before opening a PR.
+
 ## Current Limits
 
 - Ephemeral identity keys only.

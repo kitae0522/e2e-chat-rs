@@ -54,6 +54,17 @@ This keeps v1 tiny while making the delivery boundary visible.
 
 Hooks are observational only. They do not authorize, reject, store, mutate, or retry events. Auth and persistence are separate future boundaries.
 
+## Resource Limits
+
+The relay accepts only small E2EE control events and chat messages; file or
+media transfer is out of scope for v1 and must revisit these limits.
+
+- WebSocket message size: 64 KiB (`MAX_EVENT_BYTES`). Larger frames are a
+  protocol violation and close the connection.
+- Per-client event queue: 256 events (`OUTBOX_CAPACITY`). When a slow client's
+  outbox is full, the relay closes that connection instead of dropping events
+  silently.
+
 ## Client Identity Policy
 
 `ClientId` is a protocol-sensitive value: it routes envelopes and is bound into

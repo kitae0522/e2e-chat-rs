@@ -18,11 +18,27 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::router::InMemoryRouter;
 
+/// Maximum WebSocket text payload accepted from a client.
+const MAX_EVENT_BYTES: usize = 64 * 1024;
+
+/// Per-client event queue capacity. A full outbox closes the connection.
+const OUTBOX_CAPACITY: usize = 256;
+
+/// Per-connection channels held by the server.
+///
+/// `events` is bounded so a slow reader applies backpressure as a full queue;
+/// `close` asks the connection task to end so the normal unregister path runs.
+#[derive(Clone)]
+struct ClientHandle {
+    events: mpsc::Sender<WireEvent>,
+    close: mpsc::UnboundedSender<()>,
+}
+
 struct ServerState<R, H, A> {
     router: Arc<Mutex<R>>,
     hook: Arc<Mutex<H>>,
     auth: Arc<Mutex<A>>,
-    connections: Arc<Mutex<HashMap<ClientId, mpsc::UnboundedSender<WireEvent>>>>,
+    connections: Arc<Mutex<HashMap<ClientId, ClientHandle>>>,
 }
 
 impl<R, H, A> ServerState<R, H, A> {
@@ -161,7 +177,9 @@ where
     H: EventHook + Send + 'static,
     A: AuthProvider + Send + 'static,
 {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.max_message_size(MAX_EVENT_BYTES)
+        .max_frame_size(MAX_EVENT_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 async fn handle_socket<R, H, A>(socket: WebSocket, state: ServerState<R, H, A>)
@@ -180,10 +198,18 @@ where
         return;
     }
 
-    let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
-    if register_client(&state, client_id.clone(), event_sender.clone())
-        .await
-        .is_err()
+    let (event_sender, mut event_receiver) = mpsc::channel(OUTBOX_CAPACITY);
+    let (close_sender, mut close_receiver) = mpsc::unbounded_channel::<()>();
+    if register_client(
+        &state,
+        client_id.clone(),
+        ClientHandle {
+            events: event_sender.clone(),
+            close: close_sender,
+        },
+    )
+    .await
+    .is_err()
     {
         return;
     }
@@ -204,21 +230,36 @@ where
         }
     });
 
-    while let Some(message) = socket_receiver.next().await {
-        let Ok(Message::Text(text)) = message else {
-            continue;
-        };
-        let Ok(event) = serde_json::from_str::<WireEvent>(&text) else {
-            continue;
-        };
+    loop {
+        tokio::select! {
+            _ = close_receiver.recv() => break,
+            message = socket_receiver.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                match message {
+                    Ok(Message::Text(text)) => {
+                        let Ok(event) = serde_json::from_str::<WireEvent>(&text) else {
+                            continue;
+                        };
 
-        if let Err(error) = route_and_flush(&state, &client_id, event.clone()).await
-            && should_report_routing_error(&event, &error)
-        {
-            let _ = event_sender.send(WireEvent::Error {
-                code: RelayErrorCode::from(&error),
-                message: format!("routing failed: {error:?}"),
-            });
+                        if let Err(error) = route_and_flush(&state, &client_id, event.clone()).await
+                            && should_report_routing_error(&event, &error)
+                            && event_sender
+                                .try_send(WireEvent::Error {
+                                    code: RelayErrorCode::from(&error),
+                                    message: format!("routing failed: {error:?}"),
+                                })
+                                .is_err()
+                        {
+                            tracing::warn!("outbox full while reporting routing error");
+                        }
+                    }
+                    // 프로토콜 에러(예: 크기 초과)는 연결을 닫는다.
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
         }
     }
 
@@ -244,8 +285,11 @@ async fn read_client_hello(
     socket_receiver: &mut futures::stream::SplitStream<WebSocket>,
 ) -> Option<ClientId> {
     while let Some(message) = socket_receiver.next().await {
-        let Ok(Message::Text(text)) = message else {
-            continue;
+        let text = match message {
+            Ok(Message::Text(text)) => text,
+            // 프로토콜 에러(예: 크기 초과)는 hello 없이 연결을 닫는다.
+            Ok(_) => continue,
+            Err(_) => return None,
         };
         let Ok(WireEvent::ClientHello { client_id, .. }) = serde_json::from_str::<WireEvent>(&text)
         else {
@@ -261,7 +305,7 @@ async fn read_client_hello(
 async fn register_client<R, H, A>(
     state: &ServerState<R, H, A>,
     client_id: ClientId,
-    sender: mpsc::UnboundedSender<WireEvent>,
+    handle: ClientHandle,
 ) -> Result<(), ()>
 where
     R: MessageRouter,
@@ -281,7 +325,7 @@ where
         .connections
         .lock()
         .await
-        .insert(client_id.clone(), sender);
+        .insert(client_id.clone(), handle);
     state.hook.lock().await.on_connect(&client_id);
     Ok(())
 }
@@ -366,33 +410,36 @@ where
         let mut router = state.router.lock().await;
         let connections = state.connections.lock().await;
         for client_id in targets {
-            let Some(sender) = connections.get(client_id) else {
+            let Some(handle) = connections.get(client_id) else {
                 continue;
             };
             let events = router.drain_outbox(client_id);
             if !events.is_empty() {
                 deliveries.push(OutboxDelivery {
-                    sender: sender.clone(),
+                    handle: handle.clone(),
+                    client_id: client_id.clone(),
                     events,
                 });
             }
         }
     }
 
-    send_outbox_deliveries(deliveries);
+    for delivery in deliveries {
+        for event in delivery.events {
+            if delivery.handle.events.try_send(event).is_err() {
+                // 큐가 찬 느린 클라이언트는 이벤트를 버리는 대신 연결을 닫는다.
+                let _ = delivery.handle.close.send(());
+                state.connections.lock().await.remove(&delivery.client_id);
+                break;
+            }
+        }
+    }
 }
 
 struct OutboxDelivery {
-    sender: mpsc::UnboundedSender<WireEvent>,
+    handle: ClientHandle,
+    client_id: ClientId,
     events: Vec<WireEvent>,
-}
-
-fn send_outbox_deliveries(deliveries: Vec<OutboxDelivery>) {
-    for delivery in deliveries {
-        for event in delivery.events {
-            let _ = delivery.sender.send(event);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -511,19 +558,43 @@ mod tests {
         let alice = ClientId::parse("alice").expect("alice");
         let bob = ClientId::parse("bob").expect("bob");
         let carol = ClientId::parse("carol").expect("carol");
-        let (alice_sender, mut alice_receiver) = mpsc::unbounded_channel();
-        let (bob_sender, mut bob_receiver) = mpsc::unbounded_channel();
-        let (carol_sender, mut carol_receiver) = mpsc::unbounded_channel();
+        let (alice_sender, mut alice_receiver) = mpsc::channel(OUTBOX_CAPACITY);
+        let (bob_sender, mut bob_receiver) = mpsc::channel(OUTBOX_CAPACITY);
+        let (carol_sender, mut carol_receiver) = mpsc::channel(OUTBOX_CAPACITY);
+        let (alice_close, _) = mpsc::unbounded_channel();
+        let (bob_close, _) = mpsc::unbounded_channel();
+        let (carol_close, _) = mpsc::unbounded_channel();
 
-        register_client(&state, alice.clone(), alice_sender)
-            .await
-            .expect("register alice");
-        register_client(&state, bob.clone(), bob_sender)
-            .await
-            .expect("register bob");
-        register_client(&state, carol.clone(), carol_sender)
-            .await
-            .expect("register carol");
+        register_client(
+            &state,
+            alice.clone(),
+            ClientHandle {
+                events: alice_sender,
+                close: alice_close,
+            },
+        )
+        .await
+        .expect("register alice");
+        register_client(
+            &state,
+            bob.clone(),
+            ClientHandle {
+                events: bob_sender,
+                close: bob_close,
+            },
+        )
+        .await
+        .expect("register bob");
+        register_client(
+            &state,
+            carol.clone(),
+            ClientHandle {
+                events: carol_sender,
+                close: carol_close,
+            },
+        )
+        .await
+        .expect("register carol");
 
         // carol의 outbox를 flush 대상 외부에서 미리 적재한다.
         // (alice→carol 메시지는 carol의 outbox에만 이벤트를 남긴다.)
@@ -571,6 +642,67 @@ mod tests {
         assert_eq!(router.drain_outbox(&carol).len(), 1);
     }
 
+    #[tokio::test]
+    async fn flush_outboxes_closes_slow_client_when_outbox_is_full() {
+        // 느린 클라이언트의 큐가 찼을 때는 이벤트를 조용히 버리지 않고 연결을 닫는다.
+        let state = ServerState::new(InMemoryRouter::default(), NoopEventHook, NoopAuthProvider);
+        let alice = ClientId::parse("alice").expect("alice");
+        let bob = ClientId::parse("bob").expect("bob");
+        let (alice_sender, _alice_receiver) = mpsc::channel(1);
+        let (alice_close, mut alice_close_receiver) = mpsc::unbounded_channel::<()>();
+        let (bob_sender, mut bob_receiver) = mpsc::channel(OUTBOX_CAPACITY);
+        let (bob_close, mut bob_close_receiver) = mpsc::unbounded_channel::<()>();
+
+        // alice의 큐를 미리 채워 둔다.
+        alice_sender
+            .send(WireEvent::Ack {
+                message_id: MessageId::new(),
+            })
+            .await
+            .expect("fill alice outbox");
+
+        register_client(
+            &state,
+            alice.clone(),
+            ClientHandle {
+                events: alice_sender,
+                close: alice_close,
+            },
+        )
+        .await
+        .expect("register alice");
+        register_client(
+            &state,
+            bob.clone(),
+            ClientHandle {
+                events: bob_sender,
+                close: bob_close,
+            },
+        )
+        .await
+        .expect("register bob");
+
+        let event = WireEvent::PeerKey {
+            from: bob.clone(),
+            to: alice.clone(),
+            public_key: PublicKeyBytes::from_array([4; 32]),
+        };
+        state
+            .router
+            .lock()
+            .await
+            .route(&bob, event.clone())
+            .expect("route peer key");
+
+        flush_outboxes(&state, &delivery_targets(&bob, &event)).await;
+
+        // alice은 큐가 차서 연결이 닫히고, bob은 영향을 받지 않는다.
+        assert!(state.connections.lock().await.get(&alice).is_none());
+        assert!(alice_close_receiver.try_recv().is_ok());
+        assert!(bob_receiver.try_recv().is_err());
+        assert!(bob_close_receiver.try_recv().is_err());
+    }
+
     #[derive(Debug, Default, PartialEq, Eq)]
     struct RecordingHook {
         calls: Vec<&'static str>,
@@ -607,11 +739,19 @@ mod tests {
             NoopAuthProvider,
         );
         let alice = ClientId::parse("alice").expect("alice");
-        let (sender, _receiver) = mpsc::unbounded_channel();
+        let (sender, _receiver) = mpsc::channel(OUTBOX_CAPACITY);
+        let (close, _close_receiver) = mpsc::unbounded_channel();
 
-        register_client(&state, alice.clone(), sender)
-            .await
-            .expect("register alice");
+        register_client(
+            &state,
+            alice.clone(),
+            ClientHandle {
+                events: sender,
+                close,
+            },
+        )
+        .await
+        .expect("register alice");
         unregister_client(&state, &alice).await;
 
         let hook = state.hook.lock().await;
@@ -629,15 +769,31 @@ mod tests {
         let alice = ClientId::parse("alice").expect("alice");
         let bob = ClientId::parse("bob").expect("bob");
         let mallory = ClientId::parse("mallory").expect("mallory");
-        let (alice_sender, _alice_receiver) = mpsc::unbounded_channel();
-        let (bob_sender, _bob_receiver) = mpsc::unbounded_channel();
+        let (alice_sender, _alice_receiver) = mpsc::channel(OUTBOX_CAPACITY);
+        let (bob_sender, _bob_receiver) = mpsc::channel(OUTBOX_CAPACITY);
+        let (alice_close, _alice_close_receiver) = mpsc::unbounded_channel();
+        let (bob_close, _bob_close_receiver) = mpsc::unbounded_channel();
 
-        register_client(&state, alice.clone(), alice_sender)
-            .await
-            .expect("register alice");
-        register_client(&state, bob.clone(), bob_sender)
-            .await
-            .expect("register bob");
+        register_client(
+            &state,
+            alice.clone(),
+            ClientHandle {
+                events: alice_sender,
+                close: alice_close,
+            },
+        )
+        .await
+        .expect("register alice");
+        register_client(
+            &state,
+            bob.clone(),
+            ClientHandle {
+                events: bob_sender,
+                close: bob_close,
+            },
+        )
+        .await
+        .expect("register bob");
 
         route_and_flush(
             &state,
@@ -701,15 +857,31 @@ mod tests {
         };
         let alice = ClientId::parse("alice").expect("alice");
         let bob = ClientId::parse("bob").expect("bob");
-        let (alice_sender, _alice_receiver) = mpsc::unbounded_channel();
-        let (bob_sender, _bob_receiver) = mpsc::unbounded_channel();
+        let (alice_sender, _alice_receiver) = mpsc::channel(OUTBOX_CAPACITY);
+        let (bob_sender, _bob_receiver) = mpsc::channel(OUTBOX_CAPACITY);
+        let (alice_close, _alice_close_receiver) = mpsc::unbounded_channel();
+        let (bob_close, _bob_close_receiver) = mpsc::unbounded_channel();
 
-        register_client(&state, alice.clone(), alice_sender)
-            .await
-            .expect("register alice");
-        register_client(&state, bob.clone(), bob_sender)
-            .await
-            .expect("register bob");
+        register_client(
+            &state,
+            alice.clone(),
+            ClientHandle {
+                events: alice_sender,
+                close: alice_close,
+            },
+        )
+        .await
+        .expect("register alice");
+        register_client(
+            &state,
+            bob.clone(),
+            ClientHandle {
+                events: bob_sender,
+                close: bob_close,
+            },
+        )
+        .await
+        .expect("register bob");
 
         route_and_flush(
             &state,

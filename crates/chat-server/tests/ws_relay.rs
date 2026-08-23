@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Context;
 use chat_core::crypto::{CryptoSession, KeyPair};
 use chat_core::event::WireEvent;
 use chat_core::service::{AuthError, AuthProvider, EventHook, MessageRouter, RouterError};
@@ -396,6 +397,39 @@ async fn builder_injects_auth_provider_and_rejects_denied_clients() -> anyhow::R
     let received_event = receive_event(&mut alice).await?;
 
     assert!(matches!(received_event, WireEvent::Error { .. }));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn closes_connection_on_oversized_message() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move { WsServer::new(listener).run().await });
+
+    let (mut alice, _) = connect_async(format!("ws://{addr}/ws")).await?;
+    send_event(
+        &mut alice,
+        &WireEvent::ClientHello {
+            client_id: ClientId::parse("alice")?,
+            public_key: PublicKeyBytes::from_array([1; 32]),
+        },
+    )
+    .await?;
+
+    // 크기 제한을 초과하는 payload는 프로토콜 위반으로 연결을 닫아야 한다.
+    let oversized = "x".repeat(128 * 1024);
+    alice
+        .send(Message::Text(oversized.into()))
+        .await
+        .context("send oversized message")?;
+
+    let next = tokio::time::timeout(Duration::from_secs(2), alice.next()).await?;
+    assert!(
+        matches!(next, None | Some(Err(_))),
+        "connection should be closed after an oversized message, got {next:?}"
+    );
 
     server.abort();
     Ok(())

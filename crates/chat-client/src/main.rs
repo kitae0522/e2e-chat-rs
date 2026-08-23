@@ -26,6 +26,11 @@ struct Args {
 
     #[arg(long)]
     peer: String,
+
+    /// Expected peer key fingerprint (64 hex chars). When set, a PeerKey whose
+    /// fingerprint differs is rejected instead of opening the session.
+    #[arg(long)]
+    verify_fingerprint: Option<String>,
 }
 
 #[tokio::main]
@@ -38,6 +43,14 @@ async fn run(args: Args) -> Result<()> {
     let local_id = ClientId::parse(args.id).context("parse local client id")?;
     let peer_id = ClientId::parse(args.peer).context("parse peer client id")?;
     let mut session = ClientSession::new(local_id, peer_id);
+    let pinned_fingerprint = args
+        .verify_fingerprint
+        .as_deref()
+        .map(normalize_fingerprint)
+        .transpose()?;
+    if let Some(expected) = &pinned_fingerprint {
+        session.expect_peer_fingerprint(expected.clone());
+    }
 
     let (socket, _) = connect_async(args.server.as_str())
         .await
@@ -89,6 +102,7 @@ async fn run(args: Args) -> Result<()> {
                             .context("decode websocket event")?;
                         let status = control_status(&event);
                         let reply_peer_key = needs_peer_key_reply(session.is_ready(), &event);
+                        let was_ready = session.is_ready();
 
                         match session.handle_event(event) {
                             Ok(Some(plaintext)) => println!("{plaintext}"),
@@ -100,6 +114,21 @@ async fn run(args: Args) -> Result<()> {
                             Err(error) => {
                                 warn!(?error, "session rejected inbound event");
                                 continue;
+                            }
+                        }
+
+                        // 세션이 ready로 전환되면 피어 지문을 표시해
+                        // 대역 검증(또는 핀 검증 결과)을 안내한다.
+                        if !was_ready && session.is_ready()
+                            && let Some(fingerprint) = session.peer_fingerprint()
+                        {
+                            if pinned_fingerprint.is_some() {
+                                eprintln!("peer fingerprint verified: {fingerprint}");
+                            } else {
+                                eprintln!(
+                                    "peer fingerprint: {fingerprint} \
+                                     (unverified -- pass --verify-fingerprint to pin)"
+                                );
                             }
                         }
 
@@ -144,6 +173,16 @@ fn needs_peer_key_reply(was_ready: bool, event: &WireEvent) -> bool {
     !was_ready && matches!(event, WireEvent::PeerKey { .. })
 }
 
+fn normalize_fingerprint(raw: &str) -> anyhow::Result<String> {
+    let normalized = raw.trim().to_lowercase();
+    anyhow::ensure!(
+        normalized.len() == 64 && normalized.chars().all(|c| c.is_ascii_hexdigit()),
+        "fingerprint must be 64 hexadecimal characters"
+    );
+
+    Ok(normalized)
+}
+
 fn control_status(event: &WireEvent) -> Option<String> {
     match event {
         WireEvent::Ack { .. } => Some("message delivered to relay".to_owned()),
@@ -174,6 +213,41 @@ mod tests {
         assert_eq!(args.server, "ws://127.0.0.1:3000/ws");
         assert_eq!(args.id, "alice");
         assert_eq!(args.peer, "bob");
+        assert_eq!(args.verify_fingerprint, None);
+    }
+
+    #[test]
+    fn parses_optional_verify_fingerprint_arg() {
+        let args = Args::parse_from([
+            "chat-client",
+            "--id",
+            "alice",
+            "--peer",
+            "bob",
+            "--verify-fingerprint",
+            &"a".repeat(64),
+        ]);
+
+        assert_eq!(
+            args.verify_fingerprint.as_deref(),
+            Some(&"a".repeat(64)[..])
+        );
+    }
+
+    #[test]
+    fn normalizes_fingerprint_case_and_whitespace() {
+        let short = "a".repeat(64);
+        let input = format!("  {}\n", short.to_uppercase());
+
+        let normalized = normalize_fingerprint(&input).expect("valid fingerprint");
+
+        assert_eq!(normalized, short);
+    }
+
+    #[test]
+    fn rejects_fingerprint_with_invalid_length_or_characters() {
+        assert!(normalize_fingerprint("abcd").is_err());
+        assert!(normalize_fingerprint(&"g".repeat(64)).is_err());
     }
 
     #[test]

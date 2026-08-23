@@ -3,7 +3,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use rand_core::OsRng;
 use serde::Serialize;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -14,6 +14,20 @@ use crate::nonce::NonceTracker;
 use crate::types::{Ciphertext, ClientId, MessageId, NonceBytes, PublicKeyBytes};
 
 const SESSION_KEY_SALT: &[u8] = b"e2e-chat-rs/session-key/v1";
+
+/// Deterministic fingerprint of a peer public key for out-of-band comparison.
+///
+/// SHA-256 over the raw key bytes, lowercase hex. Users compare this string
+/// through a separate channel to detect man-in-the-middle key substitution.
+pub fn fingerprint(public_key: &PublicKeyBytes) -> String {
+    let digest = Sha256::digest(public_key.as_array());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
 
 pub struct KeyPair {
     secret: StaticSecret,
@@ -218,7 +232,25 @@ fn nonce_prefix(local_id: &ClientId, peer_id: &ClientId) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Ciphertext, ClientId, MessageId};
+    use crate::types::{Ciphertext, ClientId, MessageId, PublicKeyBytes};
+
+    #[test]
+    fn fingerprints_public_key_deterministically() {
+        // 지문은 대역 비교의 기준이므로 결정적이어야 한다.
+        let key = PublicKeyBytes::from_array([7; 32]);
+
+        let first = fingerprint(&key);
+        let second = fingerprint(&key);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_ne!(first, fingerprint(&PublicKeyBytes::from_array([8; 32])));
+    }
 
     #[test]
     fn decrypts_message_for_matching_pair() {

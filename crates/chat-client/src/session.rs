@@ -1,4 +1,4 @@
-use chat_core::crypto::{CryptoError, CryptoSession, KeyPair};
+use chat_core::crypto::{CryptoError, CryptoSession, KeyPair, fingerprint};
 use chat_core::event::WireEvent;
 use chat_core::types::{ClientId, MessageId, PublicKeyBytes};
 
@@ -8,6 +8,7 @@ pub struct ClientSession {
     keypair: KeyPair,
     peer_public_key: Option<PublicKeyBytes>,
     crypto_session: Option<CryptoSession>,
+    expected_peer_fingerprint: Option<String>,
 }
 
 impl ClientSession {
@@ -18,7 +19,19 @@ impl ClientSession {
             keypair: KeyPair::generate(),
             peer_public_key: None,
             crypto_session: None,
+            expected_peer_fingerprint: None,
         }
+    }
+
+    /// Pins the expected peer fingerprint (hex, case/whitespace tolerant).
+    /// Inbound PeerKey events whose fingerprint differs are rejected.
+    pub fn expect_peer_fingerprint(&mut self, fingerprint: String) {
+        self.expected_peer_fingerprint = Some(fingerprint.trim().to_lowercase());
+    }
+
+    /// Fingerprint of the accepted peer key, for out-of-band verification.
+    pub fn peer_fingerprint(&self) -> Option<String> {
+        self.peer_public_key.as_ref().map(fingerprint)
     }
 
     pub fn client_hello(&self) -> WireEvent {
@@ -58,6 +71,11 @@ impl ClientSession {
                     return Err(ClientSessionError::UnexpectedPeerKey);
                 }
 
+                if let Some(expected) = &self.expected_peer_fingerprint
+                    && fingerprint(&public_key) != *expected
+                {
+                    return Err(ClientSessionError::PeerKeyFingerprintMismatch);
+                }
                 self.peer_public_key = Some(public_key);
                 self.crypto_session = Some(CryptoSession::new(
                     &self.keypair,
@@ -99,6 +117,7 @@ impl ClientSession {
 pub enum ClientSessionError {
     MissingPeerKey,
     UnexpectedPeerKey,
+    PeerKeyFingerprintMismatch,
     InvalidUtf8,
     Crypto(CryptoError),
 }
@@ -165,6 +184,73 @@ mod tests {
         alice.handle_event(bob.peer_key_event()).expect("bob key");
 
         assert!(alice.is_ready());
+    }
+
+    #[test]
+    fn accepts_peer_key_matching_expected_fingerprint() {
+        let mut alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let bob = ClientSession::new(
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+        let bob_peer_key = bob.peer_key_event();
+        let pinned = fingerprint(&match bob_peer_key {
+            WireEvent::PeerKey { public_key, .. } => public_key,
+            other => panic!("expected peer key event, got {other:?}"),
+        });
+        alice.expect_peer_fingerprint(pinned);
+
+        alice.handle_event(bob_peer_key).expect("matching peer key");
+
+        assert!(alice.is_ready());
+    }
+
+    #[test]
+    fn rejects_mismatched_fingerprint_and_stays_unready() {
+        // MITM이 키를 바꿔치기해도 기대 지문과 다르면 세션이 열리지 않아야 한다.
+        let mut alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let mallory = ClientSession::new(
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+        alice.expect_peer_fingerprint(fingerprint(&PublicKeyBytes::from_array([9; 32])));
+
+        let mallory_event = mallory.peer_key_event();
+        assert_eq!(
+            alice.handle_event(mallory_event),
+            Err(ClientSessionError::PeerKeyFingerprintMismatch)
+        );
+        assert!(!alice.is_ready());
+        assert!(alice.encrypt_line("hello").is_err());
+    }
+
+    #[test]
+    fn reports_received_peer_fingerprint_for_display() {
+        let mut alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let bob = ClientSession::new(
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+
+        assert!(alice.peer_fingerprint().is_none());
+
+        let bob_event = bob.peer_key_event();
+        let expected = fingerprint(&match bob_event {
+            WireEvent::PeerKey { public_key, .. } => public_key,
+            other => panic!("expected peer key event, got {other:?}"),
+        });
+        alice.handle_event(bob_event).expect("peer key");
+
+        assert_eq!(alice.peer_fingerprint(), Some(expected));
     }
 
     #[test]

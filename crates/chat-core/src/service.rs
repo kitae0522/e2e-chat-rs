@@ -29,6 +29,25 @@ pub trait EventHook {
     }
 }
 
+pub trait AuthProvider {
+    /// Decides whether a client may register under this identity.
+    /// Called once after ClientHello and before any routing happens.
+    fn authorize_connect(&mut self, _client_id: &ClientId) -> Result<(), AuthError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopAuthProvider;
+
+impl AuthProvider for NoopAuthProvider {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AuthError {
+    #[error("client connect was denied")]
+    ConnectDenied,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopEventHook;
 

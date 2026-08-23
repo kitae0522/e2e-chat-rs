@@ -61,6 +61,7 @@ Hooks are observational only. They do not authorize, reject, store, mutate, or r
 - unknown `PeerKey` recipients are suppressed during retry
 - duplicate `PeerKey` events do not reset an established client crypto session
 - changed peer keys are rejected until an explicit rekey protocol exists
+- peer keys can be pinned via `--verify-fingerprint`; a key whose fingerprint differs from the pin never opens a session
 - duplicate inbound nonces are rejected by the crypto session
 - tampered ciphertext or authenticated metadata fails decryption
 
@@ -70,10 +71,12 @@ These are accepted v1 boundaries, but they become real risks once the related
 features are attempted. They are recorded so that future work starts from an
 honest baseline.
 
-- **No peer authentication.** The `PeerKey` exchange is unauthenticated, and a
-  client accepts the first key it receives for its peer. A man-in-the-middle
-  can substitute keys without detection. Fingerprint verification is tracked
-  in issue #21.
+- **No peer authentication unless pinned.** The `PeerKey` exchange is still
+  unauthenticated by default, and a client accepts the first key it receives
+  for its peer. Passing `--verify-fingerprint <hex>` pins the expected peer
+  fingerprint so substituted keys are rejected; without it, the client only
+  displays the received fingerprint for manual out-of-band comparison.
+  A default-on verification flow remains tracked as future work.
 - **Nonce reuse if static keys persist.** Outbound nonces use an in-memory
   counter that starts at zero, while the session key derives from a long-term
   X25519 shared secret. If keypairs are ever persisted across restarts, the

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::types::{Ciphertext, ClientId, MessageId, NonceBytes, PublicKeyBytes};
 
@@ -9,6 +9,68 @@ pub struct EncryptedEnvelope {
     pub message_id: MessageId,
     pub nonce: NonceBytes,
     pub ciphertext: Ciphertext,
+}
+
+/// Machine-readable code carried by `WireEvent::Error`.
+///
+/// Known codes serialize as snake_case strings. Codes from newer peers that
+/// this version does not know are preserved verbatim as [`RelayErrorCode::Other`]
+/// so error events survive protocol evolution instead of failing to parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayErrorCode {
+    SenderMismatch,
+    UnknownRecipient,
+    UnsupportedEvent,
+    ClientNotConnected,
+    ClientAlreadyConnected,
+    ConnectDenied,
+    Other(String),
+}
+
+impl RelayErrorCode {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::SenderMismatch => "sender_mismatch",
+            Self::UnknownRecipient => "unknown_recipient",
+            Self::UnsupportedEvent => "unsupported_event",
+            Self::ClientNotConnected => "client_not_connected",
+            Self::ClientAlreadyConnected => "client_already_connected",
+            Self::ConnectDenied => "connect_denied",
+            Self::Other(raw) => raw,
+        }
+    }
+
+    fn from_wire(raw: &str) -> Self {
+        match raw {
+            "sender_mismatch" => Self::SenderMismatch,
+            "unknown_recipient" => Self::UnknownRecipient,
+            "unsupported_event" => Self::UnsupportedEvent,
+            "client_not_connected" => Self::ClientNotConnected,
+            "client_already_connected" => Self::ClientAlreadyConnected,
+            "connect_denied" => Self::ConnectDenied,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+impl Serialize for RelayErrorCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RelayErrorCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+
+        Ok(Self::from_wire(&raw))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +90,7 @@ pub enum WireEvent {
         message_id: MessageId,
     },
     Error {
-        code: String,
+        code: RelayErrorCode,
         message: String,
     },
 }
@@ -52,6 +114,46 @@ mod tests {
 
         assert!(encoded.contains("\"type\":\"encrypted_message\""));
         assert!(!encoded.contains("plaintext"));
+    }
+
+    #[test]
+    fn serializes_error_code_as_snake_case_contract() {
+        let event = WireEvent::Error {
+            code: RelayErrorCode::UnknownRecipient,
+            message: "recipient is not connected".to_owned(),
+        };
+
+        let encoded = serde_json::to_string(&event).expect("serialize error event");
+
+        assert!(encoded.contains("\"code\":\"unknown_recipient\""));
+    }
+
+    #[test]
+    fn preserves_unknown_error_codes_from_newer_peers() {
+        // 구버전 클라이언트도 새 코드를 받으면 이벤트를 유지해야 한다.
+        let encoded = r#"{"type":"error","code":"rekey_required","message":"rekey"}"#;
+
+        let event: WireEvent = serde_json::from_str(encoded).expect("deserialize error event");
+
+        assert_eq!(
+            event,
+            WireEvent::Error {
+                code: RelayErrorCode::Other("rekey_required".to_owned()),
+                message: "rekey".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn serializes_other_error_code_verbatim() {
+        let event = WireEvent::Error {
+            code: RelayErrorCode::Other("rekey_required".to_owned()),
+            message: "rekey".to_owned(),
+        };
+
+        let encoded = serde_json::to_string(&event).expect("serialize error event");
+
+        assert!(encoded.contains("\"code\":\"rekey_required\""));
     }
 
     #[test]

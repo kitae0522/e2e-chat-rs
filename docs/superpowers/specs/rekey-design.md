@@ -1,7 +1,8 @@
-# Rekey Protocol Design (v2 Proposal)
+# Rekey Protocol Design (v2)
 
-Status: **proposal — not implemented**
-Related: checkpoint 013 (peer key idempotency), checkpoint 017 (fingerprint pinning), issue on file
+Status: **implemented** — phase 1 (checkpoint 021), phase 2 (checkpoint 022),
+phase 3 client integration (checkpoint 023)
+Related: checkpoint 013 (peer key idempotency), checkpoint 017 (fingerprint pinning), issue #46
 
 ## Motivation
 

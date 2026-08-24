@@ -70,16 +70,20 @@ no new routing rules.
 Initiator                                Responder
 ---------                                ---------
 generate ephemeral pair Ei
-send Chat/RekeyRequest{rid, Epi}  --->   decrypt under current key
+send RekeyRequest{rid, Epi}       --->   decrypt under current key
                                          generate ephemeral pair Er
                                          derive new key (below)
-                                         switch outbound to new epoch
-                   <---                  send RekeyResponse{rid, Epr}
-decrypt under current key
+                                         send RekeyResponse{rid, Epr}
+                                         (still encrypting at old epoch)
+                  <---                   switch outbound to new epoch
+decrypt response under current key
 derive new key
 switch outbound to new epoch
 ```
 
+- The responder sends `RekeyResponse` **before** switching its outbound epoch,
+  so the response travels under the epoch the initiator can still read. Both
+  sides then switch, and dual-epoch reception covers the brief skew.
 - `rekey_id` (128-bit random) correlates request/response and prevents
   replaying an old response into a new handshake.
 - Each side switches its **outbound** key as soon as its own role completes;

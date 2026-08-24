@@ -1,5 +1,6 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use rand_core::RngCore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
@@ -8,14 +9,14 @@ use uuid::Uuid;
 ///
 /// Number arrays cost ~2x the bytes and grow with every value; base64 keeps
 /// the wire human-inspectable while halving encoded size.
-fn serialize_bytes_as_base64<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) fn serialize_bytes_as_base64<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     serializer.serialize_str(&BASE64_STANDARD.encode(bytes))
 }
 
-fn deserialize_bytes_from_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+pub(crate) fn deserialize_bytes_from_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -314,5 +315,45 @@ impl Ciphertext {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+/// Correlation id for a rekey handshake (128-bit random, base64 on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RekeyId([u8; 16]);
+
+impl RekeyId {
+    pub fn generate() -> Self {
+        let mut bytes = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut bytes);
+
+        Self(bytes)
+    }
+
+    pub fn as_array(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl Serialize for RekeyId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_bytes_as_base64(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RekeyId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = deserialize_bytes_from_base64(deserializer)?;
+        let array: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("rekey id must decode to exactly 16 bytes"))?;
+
+        Ok(Self(array))
     }
 }

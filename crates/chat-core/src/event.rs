@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::types::{Ciphertext, ClientId, MessageId, NonceBytes, PublicKeyBytes};
+use crate::types::{Ciphertext, ClientId, MessageId, NonceBytes, PublicKeyBytes, RekeyId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedEnvelope {
@@ -99,10 +99,45 @@ pub enum WireEvent {
     },
 }
 
+/// Decrypted payload of an `EncryptedEnvelope`.
+///
+/// Chat text and session control messages (rekey) share the same encrypted
+/// channel so control messages inherit the session's authentication — a
+/// network attacker cannot forge a rekey without the current session key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionPayload {
+    Chat {
+        text: String,
+    },
+    RekeyRequest {
+        rekey_id: RekeyId,
+        ephemeral_public_key: PublicKeyBytes,
+    },
+    RekeyResponse {
+        rekey_id: RekeyId,
+        ephemeral_public_key: PublicKeyBytes,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Ciphertext, ClientId, MessageId, NonceBytes, PublicKeyBytes, TypeError};
+
+    #[test]
+    fn roundtrips_session_payload_with_base64_rekey_id() {
+        let payload = SessionPayload::RekeyRequest {
+            rekey_id: RekeyId::generate(),
+            ephemeral_public_key: PublicKeyBytes::from_array([3; 32]),
+        };
+
+        let encoded = serde_json::to_string(&payload).expect("serialize payload");
+        let decoded: SessionPayload = serde_json::from_str(&encoded).expect("deserialize payload");
+
+        assert_eq!(decoded, payload);
+        assert!(!encoded.contains('['));
+    }
 
     #[test]
     fn serializes_encrypted_message_without_plaintext_field() {

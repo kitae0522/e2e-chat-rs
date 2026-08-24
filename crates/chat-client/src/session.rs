@@ -157,11 +157,14 @@ impl ClientSession {
                 ephemeral_public_key,
             } => {
                 // 요청자를 대신해 자동으로 응답한다 (세션 키 보유자만 가능).
-                let reply = session.handle_session_payload(SessionPayload::RekeyRequest {
+                let payload = SessionPayload::RekeyRequest {
                     rekey_id,
                     ephemeral_public_key,
-                })?;
-                let reply = reply.expect("rekey request yields a response");
+                };
+                // RekeyRequest에는 항상 응답이 따르지만 가드레일상 expect를 쓰지 않는다.
+                let Some(reply) = session.handle_session_payload(payload)? else {
+                    return Err(ClientSessionError::UnexpectedSessionPayload);
+                };
                 // 응답을 이전 epoch로 만든 뒤 전환을 확정한다.
                 // (reply_event는 즉시 발송되므로 여기서 커밋하는 것이 순서상 안전하다.)
                 let reply_envelope = session.encrypt_payload(&reply)?;
@@ -197,6 +200,7 @@ pub enum ClientSessionError {
     MissingPeerKey,
     UnexpectedPeerKey,
     PeerKeyFingerprintMismatch,
+    UnexpectedSessionPayload,
     Crypto(CryptoError),
 }
 

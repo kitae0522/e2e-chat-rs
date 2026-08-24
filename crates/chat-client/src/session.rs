@@ -1,6 +1,21 @@
 use chat_core::crypto::{CryptoError, CryptoSession, KeyPair, fingerprint};
-use chat_core::event::WireEvent;
-use chat_core::types::{ClientId, MessageId, PublicKeyBytes};
+use chat_core::event::{SessionPayload, WireEvent};
+use chat_core::types::{ClientId, PublicKeyBytes};
+
+/// Display-worthy result of an inbound wire event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundEvent {
+    Chat(String),
+    RekeyCompleted { epoch: u32 },
+}
+
+/// What the session produced while processing one inbound wire event.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct InboundOutcome {
+    pub event: Option<InboundEvent>,
+    /// Outbound event generated in response (e.g. rekey response).
+    pub reply_event: Option<WireEvent>,
+}
 
 pub struct ClientSession {
     local_id: ClientId,
@@ -53,7 +68,7 @@ impl ClientSession {
         self.crypto_session.is_some()
     }
 
-    pub fn handle_event(&mut self, event: WireEvent) -> Result<Option<String>, ClientSessionError> {
+    pub fn handle_event(&mut self, event: WireEvent) -> Result<InboundOutcome, ClientSessionError> {
         match event {
             WireEvent::PeerKey {
                 from,
@@ -65,7 +80,7 @@ impl ClientSession {
                 }
                 if let Some(peer_public_key) = self.peer_public_key {
                     if peer_public_key == public_key {
-                        return Ok(None);
+                        return Ok(InboundOutcome::default());
                     }
 
                     return Err(ClientSessionError::UnexpectedPeerKey);
@@ -83,33 +98,97 @@ impl ClientSession {
                     self.local_id.clone(),
                     self.peer_id.clone(),
                 ));
-                Ok(None)
+                Ok(InboundOutcome::default())
             }
-            WireEvent::EncryptedMessage(envelope) => {
-                let session = self
-                    .crypto_session
-                    .as_mut()
-                    .ok_or(ClientSessionError::MissingPeerKey)?;
-                let plaintext = session.decrypt(&envelope)?;
-                let message =
-                    String::from_utf8(plaintext).map_err(|_| ClientSessionError::InvalidUtf8)?;
-
-                Ok(Some(message))
-            }
+            WireEvent::EncryptedMessage(envelope) => self.handle_encrypted_message(envelope),
             WireEvent::ClientHello { .. } | WireEvent::Ack { .. } | WireEvent::Error { .. } => {
-                Ok(None)
+                Ok(InboundOutcome::default())
             }
         }
     }
 
     pub fn encrypt_line(&mut self, line: &str) -> Result<WireEvent, ClientSessionError> {
+        self.encrypt_payload(SessionPayload::Chat {
+            text: line.to_owned(),
+        })
+    }
+
+    /// Starts a rekey handshake and returns the request envelope to send.
+    pub fn start_rekey(&mut self) -> Result<WireEvent, ClientSessionError> {
+        let payload = self
+            .crypto_session
+            .as_mut()
+            .ok_or(ClientSessionError::MissingPeerKey)?
+            .start_rekey()?;
+
+        self.encrypt_payload(payload)
+    }
+
+    fn encrypt_payload(
+        &mut self,
+        payload: SessionPayload,
+    ) -> Result<WireEvent, ClientSessionError> {
         let session = self
             .crypto_session
             .as_mut()
             .ok_or(ClientSessionError::MissingPeerKey)?;
-        let envelope = session.encrypt(MessageId::new(), line.as_bytes())?;
+        let envelope = session.encrypt_payload(&payload)?;
 
         Ok(WireEvent::EncryptedMessage(envelope))
+    }
+
+    fn handle_encrypted_message(
+        &mut self,
+        envelope: chat_core::event::EncryptedEnvelope,
+    ) -> Result<InboundOutcome, ClientSessionError> {
+        let session = self
+            .crypto_session
+            .as_mut()
+            .ok_or(ClientSessionError::MissingPeerKey)?;
+        let payload = session.decrypt_payload(&envelope)?;
+
+        match payload {
+            SessionPayload::Chat { text } => Ok(InboundOutcome {
+                event: Some(InboundEvent::Chat(text)),
+                reply_event: None,
+            }),
+            SessionPayload::RekeyRequest {
+                rekey_id,
+                ephemeral_public_key,
+            } => {
+                // 요청자를 대신해 자동으로 응답한다 (세션 키 보유자만 가능).
+                let reply = session.handle_session_payload(SessionPayload::RekeyRequest {
+                    rekey_id,
+                    ephemeral_public_key,
+                })?;
+                let reply = reply.expect("rekey request yields a response");
+                // 응답을 이전 epoch로 만든 뒤 전환을 확정한다.
+                // (reply_event는 즉시 발송되므로 여기서 커밋하는 것이 순서상 안전하다.)
+                let reply_envelope = session.encrypt_payload(&reply)?;
+                session.commit_staged_rekey()?;
+
+                Ok(InboundOutcome {
+                    event: None,
+                    reply_event: Some(WireEvent::EncryptedMessage(reply_envelope)),
+                })
+            }
+            SessionPayload::RekeyResponse {
+                rekey_id,
+                ephemeral_public_key,
+            } => {
+                session.handle_session_payload(SessionPayload::RekeyResponse {
+                    rekey_id,
+                    ephemeral_public_key,
+                })?;
+
+                Ok(InboundOutcome {
+                    event: Some(InboundEvent::RekeyCompleted {
+                        epoch: session.epoch(),
+                    }),
+                    reply_event: None,
+                })
+            }
+        }
     }
 }
 
@@ -118,7 +197,6 @@ pub enum ClientSessionError {
     MissingPeerKey,
     UnexpectedPeerKey,
     PeerKeyFingerprintMismatch,
-    InvalidUtf8,
     Crypto(CryptoError),
 }
 
@@ -163,9 +241,52 @@ mod tests {
         alice.handle_event(bob.peer_key_event()).expect("bob key");
 
         let event = alice.encrypt_line("hello bob").expect("encrypt");
-        let decrypted = bob.handle_event(event).expect("decrypt").expect("message");
+        let outcome = bob.handle_event(event).expect("decrypt");
+        assert_eq!(outcome.reply_event, None);
 
-        assert_eq!(decrypted, "hello bob");
+        assert_eq!(
+            outcome.event,
+            Some(InboundEvent::Chat("hello bob".to_owned()))
+        );
+    }
+
+    #[test]
+    fn completes_rekey_handshake_from_inbound_request_and_replies() {
+        // 인바운드 재키 요청에는 자동 응답하고, 양쪽이 새 epoch로 수렴해야 한다.
+        let mut alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let mut bob = ClientSession::new(
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+        bob.handle_event(alice.peer_key_event()).expect("alice key");
+        alice.handle_event(bob.peer_key_event()).expect("bob key");
+
+        let request_envelope = alice.start_rekey().expect("start rekey");
+
+        let outcome = bob.handle_event(request_envelope).expect("handle request");
+        let reply_envelope = outcome
+            .reply_event
+            .expect("responder replies automatically");
+        assert_eq!(outcome.event, None);
+
+        let outcome = alice.handle_event(reply_envelope).expect("complete rekey");
+
+        assert_eq!(
+            outcome.event,
+            Some(InboundEvent::RekeyCompleted { epoch: 1 })
+        );
+
+        // 재키 이후에도 채팅이 동작한다.
+        let event = alice.encrypt_line("fresh keys").expect("encrypt");
+        let outcome = bob.handle_event(event).expect("decrypt after rekey");
+
+        assert_eq!(
+            outcome.event,
+            Some(InboundEvent::Chat("fresh keys".to_owned()))
+        );
     }
 
     #[test]

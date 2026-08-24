@@ -4,7 +4,7 @@
 )]
 
 use anyhow::{Context, Result, anyhow};
-use chat_client::session::{ClientSession, ClientSessionError};
+use chat_client::session::{ClientSession, ClientSessionError, InboundEvent};
 use chat_core::event::WireEvent;
 use chat_core::types::ClientId;
 use clap::Parser;
@@ -80,6 +80,20 @@ async fn run(args: Args) -> Result<()> {
                     continue;
                 }
 
+                if line == "/rekey" {
+                    if !session.is_ready() {
+                        eprintln!("rekey requires an established session");
+                        continue;
+                    }
+                    match session.start_rekey() {
+                        Ok(event) => send_event(&mut writer, &event).await?,
+                        Err(error) => {
+                            return Err(anyhow!("start rekey: {error:?}"));
+                        }
+                    }
+                    continue;
+                }
+
                 match session.encrypt_line(&line) {
                     Ok(event) => send_event(&mut writer, &event).await?,
                     Err(ClientSessionError::MissingPeerKey) => {
@@ -105,10 +119,20 @@ async fn run(args: Args) -> Result<()> {
                         let was_ready = session.is_ready();
 
                         match session.handle_event(event) {
-                            Ok(Some(plaintext)) => println!("{plaintext}"),
-                            Ok(None) => {
-                                if let Some(status) = status {
-                                    eprintln!("{status}");
+                            Ok(outcome) => {
+                                match outcome.event {
+                                    Some(InboundEvent::Chat(text)) => println!("{text}"),
+                                    Some(InboundEvent::RekeyCompleted { epoch }) => {
+                                        eprintln!("session key rotated to epoch {epoch}");
+                                    }
+                                    None => {
+                                        if let Some(status) = status {
+                                            eprintln!("{status}");
+                                        }
+                                    }
+                                }
+                                if let Some(reply_event) = outcome.reply_event {
+                                    send_event(&mut writer, &reply_event).await?;
                                 }
                             }
                             Err(error) => {

@@ -37,7 +37,27 @@ cargo run -p chat-client -- --id bob --peer alice
 
 Type a message in either client and press Enter. The sender prints `message delivered to relay` when the relay accepts the encrypted message. The receiver prints decrypted plaintext.
 
-Custom port:
+### Verifying the peer key
+
+By default the client displays the peer's key fingerprint (unverified). To pin it — a substituted key then never opens a session — pass the expected fingerprint:
+
+```bash
+cargo run -p chat-client -- --id alice --peer bob \
+  --verify-fingerprint <64-hex-fingerprint-of-bob>
+```
+
+Compare fingerprints out of band before trusting a session.
+
+### Rotating session keys
+
+Either client can run `/rekey` at any time to start an ephemeral-DH handshake that rolls both peers onto a fresh session key (the next epoch):
+
+```text
+/rekey
+session key rotated to epoch 1
+```
+
+### Custom port:
 
 ```bash
 CHAT_SERVER_ADDR=127.0.0.1:3001 cargo run -p chat-server
@@ -78,4 +98,4 @@ Pull requests run the same suite in CI via GitHub Actions (`.github/workflows/ve
 - Ephemeral identity keys only.
 - No offline delivery or resend.
 - Relay ACK means accepted by the relay, not read by the peer.
-- No peer fingerprint verification yet.
+- Peer fingerprint verification is opt-in via `--verify-fingerprint`; without it the fingerprint is displayed but not enforced.

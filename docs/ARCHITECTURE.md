@@ -93,8 +93,10 @@ the wire always matches the id every peer saw.
 - unknown encrypted-message recipients are reported to the sender
 - unknown `PeerKey` recipients are suppressed during retry
 - duplicate `PeerKey` events do not reset an established client crypto session
-- changed peer keys are rejected until an explicit rekey protocol exists
+- changed peer keys are rejected; recovery is an explicit user action pinned to the new fingerprint
 - peer keys can be pinned via `--verify-fingerprint`; a key whose fingerprint differs from the pin never opens a session
+- rekey handshakes ride inside the encrypted session and chain the master secret to a fresh ephemeral DH (`/rekey`)
+- envelopes carry an epoch bound into the AEAD associated data; only the current or previous epoch decrypts
 - duplicate inbound nonces are rejected by the crypto session
 - tampered ciphertext or authenticated metadata fails decryption
 

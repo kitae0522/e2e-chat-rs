@@ -24,6 +24,8 @@ pub struct ClientSession {
     peer_public_key: Option<PublicKeyBytes>,
     crypto_session: Option<CryptoSession>,
     expected_peer_fingerprint: Option<String>,
+    auto_rekey_after: Option<u32>,
+    outbound_since_rekey: u32,
 }
 
 impl ClientSession {
@@ -35,7 +37,15 @@ impl ClientSession {
             peer_public_key: None,
             crypto_session: None,
             expected_peer_fingerprint: None,
+            auto_rekey_after: None,
+            outbound_since_rekey: 0,
         }
+    }
+
+    /// Automatically starts a rekey handshake after this many outbound
+    /// messages. Disabled until set.
+    pub fn set_auto_rekey_after(&mut self, threshold: u32) {
+        self.auto_rekey_after = Some(threshold);
     }
 
     /// Pins the expected peer fingerprint (hex, case/whitespace tolerant).
@@ -107,10 +117,24 @@ impl ClientSession {
         }
     }
 
-    pub fn encrypt_line(&mut self, line: &str) -> Result<WireEvent, ClientSessionError> {
-        self.encrypt_payload(SessionPayload::Chat {
+    pub fn encrypt_line(&mut self, line: &str) -> Result<Vec<WireEvent>, ClientSessionError> {
+        let mut events = vec![self.encrypt_payload(SessionPayload::Chat {
             text: line.to_owned(),
-        })
+        })?];
+
+        if let Some(threshold) = self.auto_rekey_after {
+            self.outbound_since_rekey += 1;
+            // 진행 중인 핸드셰이크가 있으면 요청을 중첩하지 않는다.
+            let in_progress = self
+                .crypto_session
+                .as_ref()
+                .is_some_and(CryptoSession::is_rekey_in_progress);
+            if self.outbound_since_rekey >= threshold && !in_progress {
+                events.push(self.start_rekey()?);
+            }
+        }
+
+        Ok(events)
     }
 
     /// Starts a rekey handshake and returns the request envelope to send.
@@ -183,6 +207,8 @@ impl ClientSession {
                     rekey_id,
                     ephemeral_public_key,
                 })?;
+                // 완료 시 자동 재키 카운터를 리셋한다.
+                self.outbound_since_rekey = 0;
 
                 Ok(InboundOutcome {
                     event: Some(InboundEvent::RekeyCompleted {
@@ -244,8 +270,11 @@ mod tests {
         bob.handle_event(alice.peer_key_event()).expect("alice key");
         alice.handle_event(bob.peer_key_event()).expect("bob key");
 
-        let event = alice.encrypt_line("hello bob").expect("encrypt");
-        let outcome = bob.handle_event(event).expect("decrypt");
+        let events = alice.encrypt_line("hello bob").expect("encrypt");
+        assert_eq!(events.len(), 1);
+        let outcome = bob
+            .handle_event(events.into_iter().next().expect("chat event"))
+            .expect("decrypt");
         assert_eq!(outcome.reply_event, None);
 
         assert_eq!(
@@ -284,13 +313,85 @@ mod tests {
         );
 
         // 재키 이후에도 채팅이 동작한다.
-        let event = alice.encrypt_line("fresh keys").expect("encrypt");
-        let outcome = bob.handle_event(event).expect("decrypt after rekey");
+        let mut events = alice.encrypt_line("fresh keys").expect("encrypt");
+        assert_eq!(events.len(), 1);
+        let outcome = bob
+            .handle_event(events.pop().expect("chat event"))
+            .expect("decrypt after rekey");
 
         assert_eq!(
             outcome.event,
             Some(InboundEvent::Chat("fresh keys".to_owned()))
         );
+    }
+
+    #[test]
+    fn appends_rekey_request_after_threshold_outbound_messages() {
+        // 임계값 도달 시 채팅 envelope 뒤에 재키 요청을 덧붙여 보낸다.
+        let mut alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let mut bob = ClientSession::new(
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+        bob.handle_event(alice.peer_key_event()).expect("alice key");
+        alice.handle_event(bob.peer_key_event()).expect("bob key");
+        alice.set_auto_rekey_after(3);
+
+        for line in ["one", "two"] {
+            let events = alice.encrypt_line(line).expect("encrypt below threshold");
+            assert_eq!(events.len(), 1);
+        }
+
+        // 세 번째 메시지(임계값 도달)부터 재키 요청이 덧붙는다.
+        let events = alice.encrypt_line("three").expect("encrypt at threshold");
+        assert_eq!(events.len(), 2);
+
+        // 채팅과 재키 요청이 모두 정상 처리된다.
+        let outcome = bob
+            .handle_event(events[0].clone())
+            .expect("deliver chat at old epoch");
+        assert!(matches!(outcome.event, Some(InboundEvent::Chat(_))));
+
+        let outcome = bob.handle_event(events[1].clone()).expect("handle rekey");
+        let reply_envelope = outcome.reply_event.expect("automatic rekey reply");
+
+        let outcome = alice.handle_event(reply_envelope).expect("complete rekey");
+        assert_eq!(
+            outcome.event,
+            Some(InboundEvent::RekeyCompleted { epoch: 1 })
+        );
+
+        // 완료 후 카운터가 리셋되어 즉시 다시 요청하지 않는다.
+        // (리셋이 누락되면 이 메시지 하나로 재요청이 붙어 len 2가 된다.)
+        let events = alice
+            .encrypt_line("post-rekey")
+            .expect("encrypt after rekey");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn skips_auto_rekey_while_handshake_is_in_progress() {
+        // 응답 대기 중에는 요청을 중첩하지 않고 일반 전송만 한다.
+        let mut alice = ClientSession::new(
+            ClientId::parse("alice").expect("alice"),
+            ClientId::parse("bob").expect("bob"),
+        );
+        let mut bob = ClientSession::new(
+            ClientId::parse("bob").expect("bob"),
+            ClientId::parse("alice").expect("alice"),
+        );
+        bob.handle_event(alice.peer_key_event()).expect("alice key");
+        alice.handle_event(bob.peer_key_event()).expect("bob key");
+        alice.set_auto_rekey_after(1);
+
+        let first = alice.encrypt_line("one").expect("first triggers rekey");
+        assert_eq!(first.len(), 2);
+        // 응답을 아직 처리하지 않은 상태(핸드셰이크 진행 중).
+        let second = alice.encrypt_line("two").expect("encrypt while pending");
+        assert_eq!(second.len(), 1);
     }
 
     #[test]
@@ -392,7 +493,8 @@ mod tests {
 
         bob.handle_event(alice_key.clone()).expect("alice key");
         alice.handle_event(bob.peer_key_event()).expect("bob key");
-        let event = alice.encrypt_line("hello bob").expect("encrypt");
+        let mut events = alice.encrypt_line("hello bob").expect("encrypt");
+        let event = events.pop().expect("single chat event");
         bob.handle_event(event.clone()).expect("first decrypt");
 
         bob.handle_event(alice_key).expect("duplicate peer key");

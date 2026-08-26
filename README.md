@@ -57,6 +57,12 @@ Either client can run `/rekey` at any time to start an ephemeral-DH handshake th
 session key rotated to epoch 1
 ```
 
+To rotate periodically without typing the command, pass a message threshold:
+
+```bash
+cargo run -p chat-client -- --id alice --peer bob --rekey-after 100
+```
+
 ### Custom port:
 
 ```bash

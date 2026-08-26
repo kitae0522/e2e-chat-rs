@@ -105,6 +105,11 @@ impl CryptoSession {
         self.epoch
     }
 
+    /// True while a rekey handshake is started or staged but not complete.
+    pub fn is_rekey_in_progress(&self) -> bool {
+        self.pending_rekey.is_some() || self.staged_master.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn bump_epoch_for_test(&mut self) {
         self.epoch += 1;

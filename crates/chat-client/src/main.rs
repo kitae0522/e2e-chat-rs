@@ -31,6 +31,10 @@ struct Args {
     /// fingerprint differs is rejected instead of opening the session.
     #[arg(long)]
     verify_fingerprint: Option<String>,
+
+    /// Automatically start a rekey handshake after this many outbound messages.
+    #[arg(long)]
+    rekey_after: Option<u32>,
 }
 
 #[tokio::main]
@@ -43,6 +47,9 @@ async fn run(args: Args) -> Result<()> {
     let local_id = ClientId::parse(args.id).context("parse local client id")?;
     let peer_id = ClientId::parse(args.peer).context("parse peer client id")?;
     let mut session = ClientSession::new(local_id, peer_id);
+    if let Some(threshold) = args.rekey_after {
+        session.set_auto_rekey_after(threshold);
+    }
     let pinned_fingerprint = args
         .verify_fingerprint
         .as_deref()
@@ -95,7 +102,11 @@ async fn run(args: Args) -> Result<()> {
                 }
 
                 match session.encrypt_line(&line) {
-                    Ok(event) => send_event(&mut writer, &event).await?,
+                    Ok(events) => {
+                        for event in &events {
+                            send_event(&mut writer, event).await?;
+                        }
+                    }
                     Err(ClientSessionError::MissingPeerKey) => {
                         eprintln!("peer key not received yet");
                     }
@@ -256,6 +267,21 @@ mod tests {
             args.verify_fingerprint.as_deref(),
             Some(&"a".repeat(64)[..])
         );
+    }
+
+    #[test]
+    fn parses_optional_rekey_after_arg() {
+        let args = Args::parse_from([
+            "chat-client",
+            "--id",
+            "alice",
+            "--peer",
+            "bob",
+            "--rekey-after",
+            "100",
+        ]);
+
+        assert_eq!(args.rekey_after, Some(100));
     }
 
     #[test]
